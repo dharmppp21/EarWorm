@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 const PREP_SECONDS: u64 = 3;
 const EXPECTED_MAX_SECONDS: u64 = 30;
+const WINDOW_SIZE: usize = 4096;
+const HOP_SIZE: usize = 1024;
 
 fn record(expected_max_seconds: u64) -> (Vec<f32>, u32) {
     let host = cpal::default_host();
@@ -57,6 +60,43 @@ fn record(expected_max_seconds: u64) -> (Vec<f32>, u32) {
     (mono, sample_rate)
 }
 
+fn hann_window(size: usize) -> Vec<f32> {
+    (0..size)
+        .map(|n| {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / (size - 1) as f32).cos())
+        })
+        .collect()
+}
+
+fn spectogram(samples: &[f32]) -> Vec<Vec<f32>> {
+    let window = hann_window(WINDOW_SIZE);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(WINDOW_SIZE);
+
+    let mut frames = Vec::new();
+    let mut start = 0;
+    while start + WINDOW_SIZE <= samples.len() {
+        let mut buffer: Vec<Complex<f32>> = samples[start..start + WINDOW_SIZE]
+            .iter()
+            .zip(window.iter())
+            .map(|(&sample, &w)| Complex { re: sample * w, im: 0.0f32 })
+            .collect();
+
+        fft.process(&mut buffer);
+
+        let half = WINDOW_SIZE / 2;
+        let magnitudes: Vec<f32> = buffer[..=half]
+            .iter()
+            .map(|c| (c.re * c.re + c.im * c.im).sqrt())
+            .collect();
+
+        frames.push(magnitudes);
+        start += HOP_SIZE;
+    }
+
+    frames
+}
+
 fn main() {
     let (clip, sample_rate) = record(EXPECTED_MAX_SECONDS);
     println!(
@@ -65,4 +105,19 @@ fn main() {
         sample_rate,
         clip.len() as f32 / sample_rate as f32
     );
+
+    let frames = spectogram(&clip);
+    println!("{} time-frames, {} frequency bins each", frames.len(), frames[0].len());
+
+    let hz_per_bin = sample_rate as f32 / WINDOW_SIZE as f32;
+    for (i, frame) in frames.iter().enumerate() {
+        let (peak_bin, _) = frame
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+
+        let peak_hz = peak_bin as f32 * hz_per_bin;
+        println!("frame {i}: peak ~={peak_hz:.0} Hz");
+    }
 }
