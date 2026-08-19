@@ -1,104 +1,162 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc,Mutex};
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rustfft::{FftPlanner, num_complex::Complex};
+use cpal::traits::{DeviceTrait,HostTrait,StreamTrait};
+// use rustfft::{FftPlanner, num_complex::Complex}; // only needed by the commented-out spectrogram below
 
-const PREP_SECONDS: u64 = 3;
-const EXPECTED_MAX_SECONDS: u64 = 30;
-const WINDOW_SIZE: usize = 4096;
-const HOP_SIZE: usize = 1024;
+//PrepTime
+const PREP_SECONDS: u64=3;
+const EXPECTED_MAX_SECONDS: u64=30;
+//FFT
+const WINDOW_SIZE: usize=4096;
+const HOP_SIZE: usize=1024;
+//Autocorrelation
+const MIN_FREQ_HZ: f32=80.0;
+const MAX_FREQ_HZ: f32=1400.0;
 
-fn record(expected_max_seconds: u64) -> (Vec<f32>, u32) {
-    let host = cpal::default_host();
-    let device = host.default_input_device().expect("no input device found");
-    let config = device.default_input_config().expect("no default config");
 
-    let sample_rate = config.sample_rate();
-    let channels = config.channels() as usize;
+fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
+    //Device Config
+    let host=cpal::default_host();
+    let device=host.default_input_device().expect("no input device found");
+    let config=device.default_input_config().expect("no default config");
+
+    let sample_rate=config.sample_rate();
+    let channels=config.channels() as usize;
     println!("recording from {device} at {sample_rate} Hz, {channels} channel(s)");
 
-    let expected_samples = sample_rate as usize * channels * expected_max_seconds as usize;
-    let samples = Arc::new(Mutex::new(Vec::<f32>::with_capacity(expected_samples)));
-    let samples_for_callback = samples.clone();
+    //Shared Buffer
+    let expected_samples=sample_rate as usize*channels*expected_max_seconds as usize;
+    let samples=Arc::new(Mutex::new(Vec::<f32>::with_capacity(expected_samples)));
+    let samples_for_callback=samples.clone();
 
-    let err_fn = move |err| {
+    //Error Callback
+    let err_fn=move |err|{
         eprintln!("stream error: {err}");
     };
 
-    let stream = device
-        .build_input_stream(
-            config.into(),
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                samples_for_callback.lock().unwrap().extend_from_slice(data);
-            },
-            err_fn,
-            None,
-        )
-        .expect("failed to build input stream");
+    //Data Callback and stream building
+    let stream=device.build_input_stream(
+        config.into(),
+        move |data: &[f32], _: &cpal::InputCallbackInfo|{
+            samples_for_callback.lock().unwrap().extend_from_slice(data);
+        },
+        err_fn,
+        None,
+    )
+    .expect("failed to build input stream");
 
-    println!("get ready to hum...");
-    for n in (1..=PREP_SECONDS).rev() {
+    //PrepTime
+    println!("get ready to hum....");
+    for n in (1..=PREP_SECONDS).rev(){
         println!("{n}...");
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    //Recording+reading the result
     stream.play().expect("failed to start the stream");
     println!("recording now! hum something, then press enter when you are done");
-
-    let mut input = String::new();
+    
+    let mut input=String::new();
     std::io::stdin().read_line(&mut input).expect("failed to read input");
 
     drop(stream);
 
-    let interleaved = samples.lock().unwrap();
-    let mono: Vec<f32> = interleaved
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect();
+    let interleaved=samples.lock().unwrap();
+    let mono: Vec<f32>=interleaved
+    .chunks_exact(channels)
+    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+    .collect();
 
-    (mono, sample_rate)
+    (mono,sample_rate)
 }
 
-fn hann_window(size: usize) -> Vec<f32> {
-    (0..size)
-        .map(|n| {
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / (size - 1) as f32).cos())
-        })
-        .collect()
+// Superseded by autocorrelation-based pitch detection below (track_pitch /
+// detect_pitch_naive) -- kept for reference, not called by main() anymore.
+// Loudest-FFT-bin picking a harmonic instead of the fundamental, and getting
+// dominated by background audio, is exactly what motivated the switch.
+
+// fn hann_window(size: usize)->Vec<f32>{
+//     (0..size)
+//     .map(|n|{
+//         0.5*(1.0 - (2.0 * std::f32::consts::PI * n as f32 / (size-1) as f32).cos())
+//     })
+//     .collect()
+// }
+
+// fn spectogram(samples: &[f32])->Vec<Vec<f32>>{
+//     let window=hann_window(WINDOW_SIZE);
+//     let mut planner=FftPlanner::new();
+//     let fft=planner.plan_fft_forward(WINDOW_SIZE);
+//
+//     let mut frames=Vec::new();
+//     let mut start=0;
+//     while start + WINDOW_SIZE<=samples.len(){
+//         let mut buffer: Vec<Complex<f32>>=samples[start..start+WINDOW_SIZE]
+//         .iter()
+//         .zip(window.iter())
+//         .map(|(&sample,&w)| Complex {re: sample*w,im: 0.0f32})
+//         .collect();
+//
+//         fft.process(&mut buffer);
+//
+//         let half=WINDOW_SIZE/2;
+//         let magnitudes: Vec<f32>=buffer[..=half]
+//         .iter()
+//         .map(|c| (c.re*c.re + c.im*c.im).sqrt())
+//         .collect();
+//
+//         frames.push(magnitudes);
+//         start+=HOP_SIZE;
+//     }
+//
+//     frames
+// }
+
+//Autocorr score at specific lag
+fn autocorrelate_at_lag(frame: &[f32], lag: usize)->f32{
+    let n=frame.len()-lag;
+    let mut sum=0.0;
+    for i in 0..n{
+        sum+=frame[i]*frame[i+lag];
+    }
+    sum
 }
 
-fn spectogram(samples: &[f32]) -> Vec<Vec<f32>> {
-    let window = hann_window(WINDOW_SIZE);
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(WINDOW_SIZE);
+//try every lag and return highest lag score
+fn detect_pitch_naive(frame: &[f32],sample_rate:u32)->f32{
+    let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
+    let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
 
-    let mut frames = Vec::new();
-    let mut start = 0;
-    while start + WINDOW_SIZE <= samples.len() {
-        let mut buffer: Vec<Complex<f32>> = samples[start..start + WINDOW_SIZE]
-            .iter()
-            .zip(window.iter())
-            .map(|(&sample, &w)| Complex { re: sample * w, im: 0.0f32 })
-            .collect();
+    let mut best_lag=min_lag;
+    let mut best_score=f32::MIN;
 
-        fft.process(&mut buffer);
-
-        let half = WINDOW_SIZE / 2;
-        let magnitudes: Vec<f32> = buffer[..=half]
-            .iter()
-            .map(|c| (c.re * c.re + c.im * c.im).sqrt())
-            .collect();
-
-        frames.push(magnitudes);
-        start += HOP_SIZE;
+    for lag in min_lag..=max_lag{
+        let score=autocorrelate_at_lag(frame,lag);
+        if score>best_score{
+            best_score=score;
+            best_lag=lag;
+        }
     }
 
-    frames
+    sample_rate as f32 / best_lag as f32
 }
 
-fn main() {
-    let (clip, sample_rate) = record(EXPECTED_MAX_SECONDS);
+//Slide same window for spectogram but estimate pitch not loudness per bin
+fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<f32>{
+    let mut pitches=Vec::new();
+    let mut start=0;
+    while start+WINDOW_SIZE<=samples.len(){
+        let frame= &samples[start..start + WINDOW_SIZE];
+
+        pitches.push(detect_pitch_naive(frame,sample_rate));
+        start+=HOP_SIZE;
+    }
+    pitches
+}
+
+fn main(){
+    let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
     println!(
         "mono clip: {} samples at {} Hz ({:.2}s)",
         clip.len(),
@@ -106,18 +164,8 @@ fn main() {
         clip.len() as f32 / sample_rate as f32
     );
 
-    let frames = spectogram(&clip);
-    println!("{} time-frames, {} frequency bins each", frames.len(), frames[0].len());
-
-    let hz_per_bin = sample_rate as f32 / WINDOW_SIZE as f32;
-    for (i, frame) in frames.iter().enumerate() {
-        let (peak_bin, _) = frame
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
-
-        let peak_hz = peak_bin as f32 * hz_per_bin;
-        println!("frame {i}: peak ~={peak_hz:.0} Hz");
+    let pitches=track_pitch(&clip,sample_rate);
+    for (i,hz) in pitches.iter().enumerate(){
+        println!("frame {i}: pitch ~={hz:.1} Hz");
     }
 }
