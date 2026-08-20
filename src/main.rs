@@ -221,7 +221,7 @@ fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->(f32,f32){
     let mut running_sum=0.0;
     for lag in 1..=max_lag{
         running_sum+=d[lag];
-        cmndf[lag]=d[lag]* lag as f32 / running_sum;
+        cmndf[lag]=if running_sum>0.0{ d[lag]* lag as f32 / running_sum} else {1.0};
     }
 
     for lag in min_lag..=max_lag{
@@ -235,9 +235,9 @@ fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->(f32,f32){
     }
 
     let best_lag=(min_lag..=max_lag)
-    .min_by(|&a,&b| cmndf[a].partial_cmp(&cmndf[b]).unwrap())
+    .min_by(|&a,&b| cmndf[a].total_cmp(&cmndf[b]))
     .unwrap();
-
+    
     (sample_rate as f32 / best_lag as f32,cmndf[best_lag])
 }
 
@@ -250,9 +250,18 @@ fn main(){
         clip.len() as f32 / sample_rate as f32
     );
 
+    if clip.is_empty(){
+        eprintln!("no audio captured -- the selected device produced nothing");
+        return;
+    }
+
     let rms=(clip.iter().map(|s| s*s).sum::<f32>() / clip.len() as f32).sqrt();
     let peak=clip.iter().fold(0.0f32,|m,&s| m.max(s.abs()));
     println!("level: rms={rms:.4} peak={peak:.4}");
+
+    if rms<0.01{
+        eprintln!("warning: level too low, pitch detection will be unreliable");
+    }
 
     let pitches=track_pitch(&clip,sample_rate);
     for (i,(hz,confidence)) in pitches.iter().enumerate(){
