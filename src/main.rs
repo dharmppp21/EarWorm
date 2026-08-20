@@ -15,12 +15,49 @@ const MIN_FREQ_HZ: f32=80.0;
 const MAX_FREQ_HZ: f32=1400.0;
 //YIN
 const YIN_THRESHOLD: f32=0.25;
+//Mic priority: earlier = better. A mic near your mouth beats a mic across the room.
+const MIC_PREFER: [&str;3]=["jack","earbud","headphone"];
+//Ranks below every unlisted device; earlier = less bad. Bluetooth headset mics
+//negotiate 16 kHz and often stream nothing at all, so they go last.
+const MIC_DEMOTE: [&str;2]=["array","headset"];
+const MIC_REJECT: [&str;2]=["stereo mix","what u hear"];
 
+
+fn pick_input_device(host: &cpal::Host)->cpal::Device{
+    let mut best: Option<(usize,cpal::Device)>=None;
+
+    for device in host.input_devices().expect("failed to list input devices"){
+        let name=device.to_string().to_lowercase();
+
+        if MIC_REJECT.iter().any(|bad| name.contains(bad)){
+            println!("  skip  {device} (loopback, not a real mic)");
+            continue;
+        }
+
+        let rank=if let Some(i)=MIC_PREFER.iter().position(|want| name.contains(want)){
+            i
+        }else if let Some(i)=MIC_DEMOTE.iter().position(|d| name.contains(d)){
+            MIC_PREFER.len()+1+i
+        }else{
+            MIC_PREFER.len()
+        };
+
+        println!("  found {device} (priority {rank})");
+
+        if best.as_ref().map_or(true,|(r,_)| rank<*r){
+            best=Some((rank,device));
+        }
+    }
+
+    best.map(|(_,d)| d)
+    .or_else(|| host.default_input_device())
+    .expect("no input device found")
+}
 
 fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     //Device Config
     let host=cpal::default_host();
-    let device=host.default_input_device().expect("no input device found");
+    let device=pick_input_device(&host);
     let config=device.default_input_config().expect("no default config");
 
     let sample_rate=config.sample_rate();
