@@ -13,6 +13,8 @@ const HOP_SIZE: usize=1024;
 //Autocorrelation
 const MIN_FREQ_HZ: f32=80.0;
 const MAX_FREQ_HZ: f32=1400.0;
+//YIN
+const YIN_THRESHOLD: f32=0.15;
 
 
 fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
@@ -113,34 +115,38 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
 //     frames
 // }
 
-//Autocorr score at specific lag
-fn autocorrelate_at_lag(frame: &[f32], lag: usize)->f32{
-    let n=frame.len()-lag;
-    let mut sum=0.0;
-    for i in 0..n{
-        sum+=frame[i]*frame[i+lag];
-    }
-    sum
-}
+// Superseded by YIN (detect_pitch_yin below) -- kept for reference, not
+// called by main() anymore. Raw dot-product autocorrelation is structurally
+// biased toward short lags (fewer overlapping terms as lag grows), which
+// showed up as results repeatedly snapping to the two search-range boundaries
+// instead of a real pitch. YIN's normalized difference function fixes that.
 
-//try every lag and return highest lag score
-fn detect_pitch_naive(frame: &[f32],sample_rate:u32)->f32{
-    let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
-    let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
-
-    let mut best_lag=min_lag;
-    let mut best_score=f32::MIN;
-
-    for lag in min_lag..=max_lag{
-        let score=autocorrelate_at_lag(frame,lag);
-        if score>best_score{
-            best_score=score;
-            best_lag=lag;
-        }
-    }
-
-    sample_rate as f32 / best_lag as f32
-}
+// fn autocorrelate_at_lag(frame: &[f32], lag: usize)->f32{
+//     let n=frame.len()-lag;
+//     let mut sum=0.0;
+//     for i in 0..n{
+//         sum+=frame[i]*frame[i+lag];
+//     }
+//     sum
+// }
+//
+// fn detect_pitch_naive(frame: &[f32],sample_rate:u32)->f32{
+//     let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
+//     let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
+//
+//     let mut best_lag=min_lag;
+//     let mut best_score=f32::MIN;
+//
+//     for lag in min_lag..=max_lag{
+//         let score=autocorrelate_at_lag(frame,lag);
+//         if score>best_score{
+//             best_score=score;
+//             best_lag=lag;
+//         }
+//     }
+//
+//     sample_rate as f32 / best_lag as f32
+// }
 
 //Slide same window for spectogram but estimate pitch not loudness per bin
 fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<f32>{
@@ -149,10 +155,49 @@ fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<f32>{
     while start+WINDOW_SIZE<=samples.len(){
         let frame= &samples[start..start + WINDOW_SIZE];
 
-        pitches.push(detect_pitch_naive(frame,sample_rate));
+        pitches.push(detect_pitch_yin(frame,sample_rate));
         start+=HOP_SIZE;
     }
     pitches
+}
+
+fn difference_at_lag(frame: &[f32], lag: usize)->f32{
+    let n=frame.len()-lag;
+    let mut sum=0.0;
+    for i in 0..n{
+        let diff=frame[i]-frame[i+lag];
+        sum+=diff*diff;
+    }
+    sum
+}
+
+fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->f32{
+    let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
+    let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
+
+    let mut d=vec![0.0f32; max_lag+1];
+    for lag in 1..=max_lag{
+        d[lag]=difference_at_lag(frame,lag);
+    }
+
+    let mut cmndf=vec![1.0f32; max_lag+1];
+    let mut running_sum=0.0;
+    for lag in 1..=max_lag{
+        running_sum+=d[lag];
+        cmndf[lag]=d[lag]* lag as f32 / running_sum;
+    }
+
+    for lag in min_lag..=max_lag{
+        if cmndf[lag]<YIN_THRESHOLD{
+            return sample_rate as f32 / lag as f32;
+        }
+    }
+
+    let best_lag=(min_lag..=max_lag)
+    .min_by(|&a,&b| cmndf[a].partial_cmp(&cmndf[b]).unwrap())
+    .unwrap();
+    
+    sample_rate as f32 / best_lag as f32
 }
 
 fn main(){
