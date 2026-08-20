@@ -213,6 +213,10 @@ fn main(){
         clip.len() as f32 / sample_rate as f32
     );
 
+    let rms=(clip.iter().map(|s| s*s).sum::<f32>() / clip.len() as f32).sqrt();
+    let peak=clip.iter().fold(0.0f32,|m,&s| m.max(s.abs()));
+    println!("level: rms={rms:.4} peak={peak:.4}");
+
     let pitches=track_pitch(&clip,sample_rate);
     for (i,(hz,confidence)) in pitches.iter().enumerate(){
         println!("frame {i}: pitch ~={hz:.1} Hz (confidence={confidence:.3})");
