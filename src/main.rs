@@ -14,7 +14,7 @@ const HOP_SIZE: usize=1024;
 const MIN_FREQ_HZ: f32=80.0;
 const MAX_FREQ_HZ: f32=1400.0;
 //YIN
-const YIN_THRESHOLD: f32=0.15;
+const YIN_THRESHOLD: f32=0.25;
 
 
 fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
@@ -149,7 +149,7 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
 // }
 
 //Slide same window for spectogram but estimate pitch not loudness per bin
-fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<f32>{
+fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<(f32,f32)>{
     let mut pitches=Vec::new();
     let mut start=0;
     while start+WINDOW_SIZE<=samples.len(){
@@ -171,7 +171,7 @@ fn difference_at_lag(frame: &[f32], lag: usize)->f32{
     sum
 }
 
-fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->f32{
+fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->(f32,f32){
     let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
     let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
 
@@ -189,15 +189,19 @@ fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->f32{
 
     for lag in min_lag..=max_lag{
         if cmndf[lag]<YIN_THRESHOLD{
-            return sample_rate as f32 / lag as f32;
+            let mut best=lag;
+            while best+1<=max_lag && cmndf[best+1]<cmndf[best]{
+                best+=1;
+            }
+            return (sample_rate as f32 / best as f32,cmndf[best]);
         }
     }
 
     let best_lag=(min_lag..=max_lag)
     .min_by(|&a,&b| cmndf[a].partial_cmp(&cmndf[b]).unwrap())
     .unwrap();
-    
-    sample_rate as f32 / best_lag as f32
+
+    (sample_rate as f32 / best_lag as f32,cmndf[best_lag])
 }
 
 fn main(){
@@ -210,7 +214,7 @@ fn main(){
     );
 
     let pitches=track_pitch(&clip,sample_rate);
-    for (i,hz) in pitches.iter().enumerate(){
-        println!("frame {i}: pitch ~={hz:.1} Hz");
+    for (i,(hz,confidence)) in pitches.iter().enumerate(){
+        println!("frame {i}: pitch ~={hz:.1} Hz (confidence={confidence:.3})");
     }
 }
