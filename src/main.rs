@@ -26,6 +26,13 @@ const VOICED_MAX_CMNDF: f32=0.30;
 const NOTE_NAMES: [&str;12]=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 //Median filter
 const MEDIAN_WINDOW: usize=5;
+//Note segmentation
+const NOTE_CHANGE_ST: f32=1.0;
+const MIN_NOTE_FRAMES: usize=5;
+const MAX_GAP_FRAMES: usize=2;
+//A jump this big between neighbouring notes is more likely an octave error
+//than something a person hummed.
+const OCTAVE_JUMP_ST: f32=6.0;
 
 
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
@@ -293,6 +300,112 @@ fn median_filter(track: &[Option<f32>])->Vec<Option<f32>>{
     .collect()
 }
 
+//One sung note: its pitch, and which frames it covered.
+struct Note{
+    semitones: f32,
+    start: usize,
+    end: usize,
+}
+
+//Median of the frames collected so far, not the mean -- same reason as the
+//median filter. Drops anything too short to have been sung on purpose.
+fn push_note(notes: &mut Vec<Note>,current: &mut Vec<f32>,start: usize,end: usize){
+    if current.len()>=MIN_NOTE_FRAMES{
+        current.sort_by(f32::total_cmp);
+        notes.push(Note{
+            semitones: current[current.len()/2],
+            start,
+            end,
+        });
+    }
+    current.clear();
+}
+
+//Walk the smoothed track and cut it into notes. A note ends when the pitch
+//moves away from where the note has been sitting, or when the voice stops for
+//long enough that it was not just a dropped frame.
+fn segment_notes(track: &[Option<f32>])->Vec<Note>{
+    let mut notes=Vec::new();
+    let mut current: Vec<f32>=Vec::new();
+    let mut start=0;
+    let mut end=0;
+    let mut gap=0;
+
+    for (i,frame) in track.iter().copied().enumerate(){
+        match frame{
+            Some(p)=>{
+                if current.is_empty(){
+                    start=i;
+                }
+                else{
+                    //Compare against the note's running average, not the last
+                    //frame, so slow drift inside a held note does not add up
+                    //into a false boundary.
+                    let mean=current.iter().sum::<f32>() / current.len() as f32;
+                    if (p-mean).abs()>NOTE_CHANGE_ST{
+                        push_note(&mut notes,&mut current,start,end);
+                        start=i;
+                    }
+                }
+
+                current.push(p);
+                end=i;
+                gap=0;
+            }
+            None=>{
+                if !current.is_empty(){
+                    gap+=1;
+                    if gap>MAX_GAP_FRAMES{
+                        push_note(&mut notes,&mut current,start,end);
+                    }
+                }
+            }
+        }
+    }
+
+    //Whatever is still open when the clip ends is a note too.
+    push_note(&mut notes,&mut current,start,end);
+    notes
+}
+
+//YIN sometimes locks onto half the true period, which reads as the right note
+//an octave too high. It shows up as a lone note ~12 semitones off its
+//neighbours that immediately returns. Fold those back toward the local line.
+//Heuristic: real hummed leaps bigger than OCTAVE_JUMP_ST are rare.
+fn fix_octaves(notes: &mut [Note])->usize{
+    let mut fixed=0;
+
+    for i in 0..notes.len(){
+        let mut context: Vec<f32>=Vec::new();
+        if i>0{ context.push(notes[i-1].semitones); }
+        if i+1<notes.len(){ context.push(notes[i+1].semitones); }
+        if context.is_empty(){ continue; }
+
+        let local=context.iter().sum::<f32>() / context.len() as f32;
+        let p=notes[i].semitones;
+
+        if (p-local).abs()>OCTAVE_JUMP_ST{
+            let shifted=if p>local{ p-12.0 } else { p+12.0 };
+            if (shifted-local).abs()<(p-local).abs(){
+                notes[i].semitones=shifted;
+                fixed+=1;
+            }
+        }
+    }
+
+    fixed
+}
+
+//A melody is the gaps between notes, not the notes themselves. Sing it in any
+//key and every note changes; every gap stays the same. This is what makes
+//matching possible at all.
+fn intervals(pitches: &[f32])->Vec<f32>{
+    pitches
+    .windows(2)
+    .map(|pair| pair[1]-pair[0])
+    .collect()
+}
+
 fn main(){
     let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
     println!(
@@ -330,10 +443,37 @@ fn main(){
     let voiced=track.iter().filter(|n| n.is_some()).count();
     println!("{voiced} of {} frames voiced",track.len());
 
-    for (i,note) in track.iter().enumerate(){
-        match note{
-            Some(s)=>println!("frame {i}: {s:.2} st  ({})",note_name(*s)),
-            None=>println!("frame {i}: --"),
-        }
+    //Per-frame dump -- useful while tuning the pitch track, far too noisy once
+    //segmentation works. Uncomment to debug a bad take.
+    // for (i,note) in track.iter().enumerate(){
+    //     match note{
+    //         Some(s)=>println!("frame {i}: {s:.2} st  ({})",note_name(*s)),
+    //         None=>println!("frame {i}: --"),
+    //     }
+    // }
+
+    let mut notes=segment_notes(&track);
+    let fixed=fix_octaves(&mut notes);
+    println!("octave-corrected {fixed} notes");
+
+    let seconds=|f: usize| f as f32 * HOP_SIZE as f32 / sample_rate as f32;
+
+    println!("--- {} notes ---",notes.len());
+    for (i,n) in notes.iter().enumerate(){
+        println!(
+            "note {i}: {:<4} {:6.2} st   frames {:>3}-{:<3}  {:.2}s -> {:.2}s",
+            note_name(n.semitones),
+            n.semitones,
+            n.start,
+            n.end,
+            seconds(n.start),
+            seconds(n.end+1),
+        );
     }
+
+    let pitches: Vec<f32>=notes.iter().map(|n| n.semitones).collect();
+    let steps=intervals(&pitches);
+    println!("--- {} intervals (semitones between consecutive notes) ---",steps.len());
+    let line: Vec<String>=steps.iter().map(|d| format!("{d:+.1}")).collect();
+    println!("{}",line.join(" "));
 }
