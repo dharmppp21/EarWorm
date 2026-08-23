@@ -21,6 +21,9 @@ const MIC_PREFER: [&str;3]=["jack","earbud","headphone"];
 //negotiate 16 kHz and often stream nothing at all, so they go last.
 const MIC_DEMOTE: [&str;2]=["array","headset"];
 const MIC_REJECT: [&str;2]=["stereo mix","what u hear"];
+//Pitch cleaning
+const VOICED_MAX_CMNDF: f32=0.30;
+const NOTE_NAMES: [&str;12]=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 
 
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
@@ -241,6 +244,31 @@ fn detect_pitch_yin(frame: &[f32], sample_rate: u32)->(f32,f32){
     (sample_rate as f32 / best_lag as f32,cmndf[best_lag])
 }
 
+fn hz_to_semitones(hz: f32)->f32{
+    12.0*(hz/440.0).log2()+69.0
+}
+
+fn clean_pitch_track(pitches: &[(f32,f32)])->Vec<Option<f32>>{
+    pitches
+    .iter()
+    .map(|&(hz,confidence)|{
+        if confidence<VOICED_MAX_CMNDF && hz>0.0{
+            Some(hz_to_semitones(hz))
+        }
+        else{
+            None
+        }
+    })
+    .collect()
+}
+
+fn note_name(semitones: f32)->String{
+    let midi=semitones.round() as i32;
+    let name =NOTE_NAMES[midi.rem_euclid(12) as usize];
+    let octave=midi.div_euclid(12)-1;
+    format!("{name}{octave}")
+}
+
 fn main(){
     let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
     println!(
@@ -264,7 +292,15 @@ fn main(){
     }
 
     let pitches=track_pitch(&clip,sample_rate);
-    for (i,(hz,confidence)) in pitches.iter().enumerate(){
-        println!("frame {i}: pitch ~={hz:.1} Hz (confidence={confidence:.3})");
+    let track=clean_pitch_track(&pitches);
+
+    let voiced=track.iter().filter(|n| n.is_some()).count();
+    println!("{voiced} of {} frames voiced",track.len());
+
+    for (i,note) in track.iter().enumerate(){
+        match note{
+            Some(s)=>println!("frame {i}: {s:.2} st  ({})",note_name(*s)),
+            None=>println!("frame {i}: --"),
+        }
     }
 }

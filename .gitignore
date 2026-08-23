@@ -1,2 +1,5 @@
 /target
 .vs/
+
+# downloaded reference midis: commercial songs, not ours to redistribute
+/midi/
