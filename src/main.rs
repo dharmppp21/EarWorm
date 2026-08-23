@@ -24,6 +24,8 @@ const MIC_REJECT: [&str;2]=["stereo mix","what u hear"];
 //Pitch cleaning
 const VOICED_MAX_CMNDF: f32=0.30;
 const NOTE_NAMES: [&str;12]=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+//Median filter
+const MEDIAN_WINDOW: usize=5;
 
 
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
@@ -269,6 +271,28 @@ fn note_name(semitones: f32)->String{
     format!("{name}{octave}")
 }
 
+//A single wrong frame becomes a fake note once we segment, so smooth first.
+//Median not mean: the median only cares about ordering, so one octave-slipped
+//frame out of five can never be the middle value no matter how far off it is.
+fn median_filter(track: &[Option<f32>])->Vec<Option<f32>>{
+    (0..track.len())
+    .map(|i|{
+        //Smooths pitch; never invents voicing where there was none.
+        if track[i].is_none(){
+            return None;
+        }
+
+        let lo=i.saturating_sub(MEDIAN_WINDOW/2);
+        let hi=(i+MEDIAN_WINDOW/2+1).min(track.len());
+
+        let mut window: Vec<f32>=track[lo..hi].iter().filter_map(|&n| n).collect();
+        window.sort_by(f32::total_cmp);
+
+        Some(window[window.len()/2])
+    })
+    .collect()
+}
+
 fn main(){
     let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
     println!(
@@ -292,7 +316,16 @@ fn main(){
     }
 
     let pitches=track_pitch(&clip,sample_rate);
-    let track=clean_pitch_track(&pitches);
+    let raw=clean_pitch_track(&pitches);
+    let track=median_filter(&raw);
+
+    let smoothed=raw.iter().zip(track.iter())
+    .filter(|(a,b)| match (a,b){
+        (Some(x),Some(y))=>(x-y).abs()>0.5,
+        _=>false,
+    })
+    .count();
+    println!("median filter changed {smoothed} frames");
 
     let voiced=track.iter().filter(|n| n.is_some()).count();
     println!("{voiced} of {} frames voiced",track.len());
