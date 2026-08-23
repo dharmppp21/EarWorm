@@ -2,6 +2,7 @@ use std::sync::{Arc,Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait,HostTrait,StreamTrait};
+use midly::{Smf,TrackEventKind,MetaMessage,MidiMessage};
 // use rustfft::{FftPlanner, num_complex::Complex}; // only needed by the commented-out spectrogram below
 
 //PrepTime
@@ -406,7 +407,163 @@ fn intervals(pitches: &[f32])->Vec<f32>{
     .collect()
 }
 
+//--- MIDI side: the reference melodies we match against --------------------
+
+#[derive(Clone)]
+struct MidiNote{
+    key: u8,
+    start: u32,
+    end: u32,
+}
+
+struct TrackInfo{
+    index: usize,
+    name: String,
+    channel: u8,
+    notes: Vec<MidiNote>,
+    overlap: f32,
+    mean_key: f32,
+}
+
+//A midi track is a stream of note-on/note-off events separated by delta times.
+//Running totals turn deltas into absolute ticks; pairing each note-on with its
+//matching note-off turns events into notes.
+fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
+    let bytes=std::fs::read(path).expect("could not read midi file");
+    let smf=Smf::parse(&bytes).expect("could not parse midi file");
+    let mut infos=Vec::new();
+
+    for (index,track) in smf.tracks.iter().enumerate(){
+        let mut name=String::new();
+        let mut channel: Option<u8>=None;
+        let mut open: Vec<(u8,u32)>=Vec::new();
+        let mut notes: Vec<MidiNote>=Vec::new();
+        let mut tick: u32=0;
+
+        for ev in track{
+            tick+=ev.delta.as_int();
+
+            match ev.kind{
+                TrackEventKind::Meta(MetaMessage::TrackName(n))=>{
+                    name=String::from_utf8_lossy(n).trim().to_string();
+                }
+                TrackEventKind::Midi{channel: ch,message}=>{
+                    channel.get_or_insert(ch.as_int());
+
+                    match message{
+                        //Velocity 0 on a note-on means note-off, by convention.
+                        MidiMessage::NoteOn{key,vel} if vel.as_int()>0=>{
+                            open.push((key.as_int(),tick));
+                        }
+                        MidiMessage::NoteOn{key,..}|MidiMessage::NoteOff{key,..}=>{
+                            let k=key.as_int();
+                            if let Some(pos)=open.iter().position(|&(ok,_)| ok==k){
+                                let (_,start)=open.remove(pos);
+                                notes.push(MidiNote{key:k,start,end:tick});
+                            }
+                        }
+                        _=>{}
+                    }
+                }
+                _=>{}
+            }
+        }
+
+        notes.sort_by_key(|n| n.start);
+
+        //How often does a note start before the previous one ended? A sung
+        //melody is nearly monophonic; chords, pads and drums are not.
+        let overlaps=notes.windows(2).filter(|w| w[1].start<w[0].end).count();
+        let overlap=if notes.len()>1{ overlaps as f32/(notes.len()-1) as f32 } else { 1.0 };
+        let mean_key=if notes.is_empty(){ 0.0 } else {
+            notes.iter().map(|n| n.key as f32).sum::<f32>() / notes.len() as f32
+        };
+
+        infos.push(TrackInfo{
+            index,
+            name,
+            channel: channel.unwrap_or(255),
+            notes,
+            overlap,
+            mean_key,
+        });
+    }
+
+    infos
+}
+
+//Nothing in a midi file labels the melody, so guess: long enough to be a tune,
+//not channel 9 (drums), inside a range a person could sing, and as close to
+//monophonic as we can find.
+fn pick_melody_track(tracks: &[TrackInfo])->Option<&TrackInfo>{
+    tracks
+    .iter()
+    .filter(|t| t.notes.len()>=8)
+    .filter(|t| t.channel!=9)
+    .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
+    .min_by(|a,b| a.overlap.total_cmp(&b.overlap))
+}
+
+//Flatten whatever overlap remains into a single line. The melody is normally
+//the top voice, so when two notes sound together keep the higher one.
+fn melody_line(notes: &[MidiNote])->Vec<f32>{
+    let mut line: Vec<MidiNote>=Vec::new();
+
+    for n in notes{
+        match line.last_mut(){
+            Some(prev) if n.start<prev.end=>{
+                if n.key>prev.key{ *prev=n.clone(); }
+            }
+            _=>line.push(n.clone()),
+        }
+    }
+
+    line.iter().map(|n| n.key as f32).collect()
+}
+
+fn inspect_midi(path: &str){
+    let tracks=load_midi_tracks(path);
+
+    println!("{path}: {} tracks",tracks.len());
+    println!("  {:<3} {:<26} {:>3} {:>6} {:>9} {:>8}","#","name","ch","notes","mean key","overlap");
+
+    for t in &tracks{
+        println!(
+            "  {:<3} {:<26} {:>3} {:>6} {:>9.1} {:>7.0}%",
+            t.index,
+            if t.name.is_empty(){ "-" } else { t.name.as_str() },
+            t.channel,
+            t.notes.len(),
+            t.mean_key,
+            t.overlap*100.0,
+        );
+    }
+
+    match pick_melody_track(&tracks){
+        Some(t)=>{
+            let line=melody_line(&t.notes);
+            let steps=intervals(&line);
+
+            println!("--- melody guess: track {} \"{}\" ({} notes) ---",t.index,t.name,line.len());
+
+            let names: Vec<String>=line.iter().take(24).map(|&k| note_name(k)).collect();
+            println!("first notes:     {}",names.join(" "));
+
+            let out: Vec<String>=steps.iter().take(40).map(|d| format!("{d:+.0}")).collect();
+            println!("first intervals: {}",out.join(" "));
+        }
+        None=>println!("no track looked like a singable melody"),
+    }
+}
+
 fn main(){
+    //`cargo run -- midi/balada-gusttavo-lima.mid` inspects a midi file instead
+    //of recording, so the reference side can be worked on without humming.
+    if let Some(path)=std::env::args().nth(1){
+        inspect_midi(&path);
+        return;
+    }
+
     let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
     println!(
         "mono clip: {} samples at {} Hz ({:.2}s)",
