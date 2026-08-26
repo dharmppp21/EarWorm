@@ -528,17 +528,47 @@ fn melody_line(notes: &[MidiNote])->Vec<f32>{
     line.iter().map(|n| n.key as f32).collect()
 }
 
+//What instrument each track is set to, which is how you tell a backing
+//arrangement from one that carries the tune.
+fn track_instruments(path: &str)->std::collections::HashMap<usize,String>{
+    let bytes=std::fs::read(path).expect("could not read midi file");
+    let smf=Smf::parse(&bytes).expect("could not parse midi file");
+    let mut out=std::collections::HashMap::new();
+
+    for (i,track) in smf.tracks.iter().enumerate(){
+        let mut progs: Vec<u8>=Vec::new();
+
+        for ev in track{
+            if let TrackEventKind::Midi{message: MidiMessage::ProgramChange{program},..}=ev.kind{
+                let p=program.as_int();
+                if !progs.contains(&p){ progs.push(p); }
+            }
+        }
+
+        if !progs.is_empty(){
+            let names: Vec<String>=progs.iter()
+            .map(|&p| format!("{}({p})",GM_FAMILY[(p/8) as usize]))
+            .collect();
+            out.insert(i,names.join(","));
+        }
+    }
+
+    out
+}
+
 fn inspect_midi(path: &str){
     let tracks=load_midi_tracks(path);
+    let instruments=track_instruments(path);
 
     println!("{path}: {} tracks",tracks.len());
-    println!("  {:<3} {:<26} {:>3} {:>6} {:>9} {:>8}","#","name","ch","notes","mean key","overlap");
+    println!("  {:<3} {:<18} {:<20} {:>3} {:>6} {:>9} {:>8}","#","name","instrument","ch","notes","mean key","overlap");
 
     for t in &tracks{
         println!(
-            "  {:<3} {:<26} {:>3} {:>6} {:>9.1} {:>7.0}%",
+            "  {:<3} {:<18} {:<20} {:>3} {:>6} {:>9.1} {:>7.0}%",
             t.index,
             if t.name.is_empty(){ "-" } else { t.name.as_str() },
+            instruments.get(&t.index).map(|s| s.as_str()).unwrap_or("-"),
             t.channel,
             t.notes.len(),
             t.mean_key,
@@ -806,6 +836,86 @@ fn melody_shape(steps: &[f32])->Vec<f32>{
     .collect()
 }
 
+//Rank whole songs, not tracks: score every track in every file and let each
+//song's best track stand for it. This is the question recognition actually
+//asks -- with one file the matcher can only rank tracks inside it, and nothing
+//is ever given the chance to lose.
+//Assumes the folder holds valid midis; a corrupt one will panic in parsing.
+fn match_against_library(dir: &str,query: &[f32]){
+    let shape=melody_shape(query);
+
+    if shape.len()<4{
+        println!("only {} real moves -- hum a longer or less flat phrase",shape.len());
+        return;
+    }
+
+    println!("hum shape ({} moves): {}",shape.len(),
+        shape.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
+
+
+    let entries=match std::fs::read_dir(dir){
+        Ok(e)=>e,
+        Err(e)=>{
+            eprintln!("could not read {dir}: {e}");
+            return;
+        }
+    };
+
+    let mut songs: Vec<(f32,String,usize,usize,usize)>=Vec::new();
+
+    for entry in entries.flatten(){
+        let path=entry.path();
+
+        if path.extension().and_then(|e| e.to_str())!=Some("mid"){
+            continue;
+        }
+
+        let name=path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let tracks=load_midi_tracks(&path.to_string_lossy());
+        let mut best: Option<(f32,usize,usize,usize)>=None;
+
+        for t in &tracks{
+            let refs=melody_shape(&intervals(&melody_line(&t.notes)));
+
+            if refs.len()<shape.len(){
+                continue;
+            }
+
+            let (cost,start,end)=subsequence_dtw(&shape,&refs);
+
+            if best.map_or(true,|(b,_,_,_)| cost<b){
+                best=Some((cost,t.index,start,end));
+            }
+        }
+
+        if let Some((cost,track,start,end))=best{
+            songs.push((cost,name,track,start,end));
+        }
+    }
+
+    songs.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+    println!("--- {} songs ranked (lower = better) ---",songs.len());
+    for (cost,name,track,start,end) in &songs{
+        println!("  {cost:>7.4}  {name:<36} trk {track:<3} at {start}-{end}");
+    }
+
+    if songs.len()>=2{
+        let best=songs[0].0;
+        let next=songs[1].0;
+        let margin=next / best.max(1e-6);
+
+        println!("best {best:.4}, next {next:.4} -- {margin:.2}x margin");
+
+        if margin<1.5{
+            println!("verdict: no clear match, the field is bunched");
+        }
+        else{
+            println!("verdict: {}",songs[0].1);
+        }
+    }
+}
+
 //Score the hum against every track and rank them. Which track wins answers
 //"did I sing the vocal line or the synth hook" as a result instead of a guess.
 //The gap between best and second is what says whether anything matched at all.
@@ -863,22 +973,92 @@ fn match_against_midi(path: &str,query: &[f32]){
     }
 }
 
+//General MIDI groups programs in eights. Knowing a track is a Bass or a Flute
+//says more than its note statistics do -- a karaoke file with no lead vocal
+//looks perfectly healthy until you read the instrument list.
+const GM_FAMILY: [&str;16]=["Piano","ChromPerc","Organ","Guitar","Bass","Strings",
+    "Ensemble","Brass","Reed","Pipe","SynthLead","SynthPad","SynthFX","Ethnic",
+    "Percussive","SoundFX"];
+
+//Take a slice of one song's own melody and ask the library which song it is.
+//A system that works must rank that song first, by a wide margin. No mic
+//needed, so this is the regression test for matching.
+fn verify(dir: &str){
+    let mut files: Vec<std::path::PathBuf>=std::fs::read_dir(dir).expect("dir")
+        .flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str())==Some("mid"))
+        .collect();
+    files.sort();
+
+    for probe in &files{
+        let tracks=load_midi_tracks(&probe.to_string_lossy());
+        let best_track=tracks.iter()
+            .filter(|t| t.channel!=9 && t.notes.len()>=40)
+            .min_by(|a,b| a.overlap.total_cmp(&b.overlap));
+        let Some(bt)=best_track else{ continue; };
+
+        let full=melody_shape(&intervals(&melody_line(&bt.notes)));
+        if full.len()<30{ continue; }
+
+        //A 20-move slice from the middle, like humming one section -- then
+        //damaged the way a real hum is: two intervals off by a semitone, one
+        //note missed entirely. An exact copy of the melody would only prove
+        //the file loader works.
+        let mut query: Vec<f32>=full[full.len()/3..full.len()/3+20].to_vec();
+        query[3]+=1.0;
+        query[11]-=1.0;
+        query.remove(7);
+
+        let mut scored: Vec<(f32,String)>=Vec::new();
+        for f in &files{
+            let ts=load_midi_tracks(&f.to_string_lossy());
+            let mut b=f32::INFINITY;
+            for t in &ts{
+                let refs=melody_shape(&intervals(&melody_line(&t.notes)));
+                if refs.len()<query.len(){ continue; }
+                let (c,_,_)=subsequence_dtw(&query,&refs);
+                if c<b{ b=c; }
+            }
+            if b.is_finite(){
+                scored.push((b,f.file_stem().unwrap().to_string_lossy().to_string()));
+            }
+        }
+        scored.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+        let want=probe.file_stem().unwrap().to_string_lossy().to_string();
+        let hit=scored[0].1==want;
+        let margin=if scored.len()>1 && scored[0].0>1e-4{ scored[1].0/scored[0].0 } else { f32::INFINITY };
+        println!("{} {:<34} -> {:<34} {:.4} vs {:.4}  {:.1}x",
+            if hit{"PASS"}else{"FAIL"},want,scored[0].1,scored[0].0,scored[1].0,margin);
+    }
+}
+
 fn main(){
     let args: Vec<String>=std::env::args().skip(1).collect();
 
     //`cargo run -- selftest`            check the matcher on known answers
-    //`cargo run -- match <file.mid>`    hum, then score every track of that song
+    //`cargo run -- verify`              every song must identify itself
+    //`cargo run -- match <mid|folder>`  hum, then rank tracks or whole songs
     //`cargo run -- <file.mid>`          inspect a midi without humming
     //`cargo run`                        hum and print the melody
     match args.first().map(|s| s.as_str()){
         Some("selftest")=>selftest(),
+        Some("verify")=>verify("midi"),
         Some("match")=>{
             match args.get(1){
                 Some(path)=>{
                     let query=capture_intervals();
-                    match_against_midi(path,&query);
+
+                    //A folder means "which song is this"; a file means "which
+                    //track of this song did I sing".
+                    if std::path::Path::new(path).is_dir(){
+                        match_against_library(path,&query);
+                    }
+                    else{
+                        match_against_midi(path,&query);
+                    }
                 }
-                None=>eprintln!("usage: cargo run -- match <file.mid>"),
+                None=>eprintln!("usage: cargo run -- match <file.mid | folder>"),
             }
         }
         Some(path)=>inspect_midi(path),
