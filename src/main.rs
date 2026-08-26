@@ -36,6 +36,15 @@ const MAX_GAP_FRAMES: usize=2;
 const OCTAVE_JUMP_ST: f32=6.0;
 //Matching: anything smaller than this is a repeated note, not a move.
 const MIN_MOVE_ST: f32=0.75;
+//Measured against this library: 7 accurate moves identify a song at ~6.7x
+//margin, 12 at ~24x, 22 at ~56x. A hum is never accurate, so it needs the
+//extra length to make up for it. Below this, expect nothing.
+const MIN_USEFUL_MOVES: usize=12;
+//Every take is kept here. Without fixed audio to re-run, tuning the front end
+//changes the code and the performance at once and neither can be blamed.
+const TAKES_DIR: &str="takes";
+
+
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
     let mut best: Option<(usize,cpal::Device)>=None;
 
@@ -744,11 +753,98 @@ fn selftest(){
     }
 }
 
+//32-bit float, so saving and reloading a clip changes nothing about it.
+fn save_take(clip: &[f32],sample_rate: u32)->Option<String>{
+    if clip.is_empty(){
+        return None;
+    }
+
+    std::fs::create_dir_all(TAKES_DIR).ok()?;
+
+    //Next free number, so takes accumulate into a test set instead of
+    //overwriting each other.
+    let mut n=1;
+    while std::path::Path::new(&format!("{TAKES_DIR}/take-{n}.wav")).exists(){
+        n+=1;
+    }
+    let path=format!("{TAKES_DIR}/take-{n}.wav");
+
+    let spec=hound::WavSpec{
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer=hound::WavWriter::create(&path,spec).ok()?;
+    for &s in clip{
+        writer.write_sample(s).ok()?;
+    }
+    writer.finalize().ok()?;
+
+    Some(path)
+}
+
+//Accepts any wav -- int or float, any depth, any channel count -- and
+//normalises to the same mono f32 that record() produces.
+fn load_wav(path: &str)->Result<(Vec<f32>,u32),hound::Error>{
+    let mut reader=hound::WavReader::open(path)?;
+    let spec=reader.spec();
+    let channels=spec.channels as usize;
+
+    let interleaved: Vec<f32>=match spec.sample_format{
+        hound::SampleFormat::Float=>{
+            reader.samples::<f32>().collect::<Result<Vec<_>,_>>()?
+        }
+        hound::SampleFormat::Int=>{
+            let scale=(1i64<<(spec.bits_per_sample-1)) as f32;
+            reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / scale))
+            .collect::<Result<Vec<_>,_>>()?
+        }
+    };
+
+    let mono: Vec<f32>=interleaved
+    .chunks_exact(channels)
+    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+    .collect();
+
+    Ok((mono,spec.sample_rate))
+}
+
+//Either a fresh performance or a saved one. Passing a wav is what makes
+//tuning measurable: the input is frozen, so any change in output came from
+//the code.
+fn clip_from(source: Option<&str>)->(Vec<f32>,u32){
+    match source{
+        Some(path)=>{
+            match load_wav(path){
+                Ok(loaded)=>{
+                    println!("loaded {path}");
+                    loaded
+                }
+                Err(e)=>{
+                    eprintln!("could not read {path}: {e}");
+                    (Vec::new(),48000)
+                }
+            }
+        }
+        None=>{
+            let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
+            if let Some(saved)=save_take(&clip,sample_rate){
+                println!("saved {saved}");
+            }
+            (clip,sample_rate)
+        }
+    }
+}
+
 //Record, clean, segment, and reduce to the interval sequence -- the melody in
 //the form everything downstream compares. Returns it so matching can use the
 //same pipeline the plain run prints.
-fn capture_intervals()->Vec<f32>{
-    let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
+fn capture_intervals(source: Option<&str>)->Vec<f32>{
+    let (clip,sample_rate)=clip_from(source);
     println!(
         "mono clip: {} samples at {} Hz ({:.2}s)",
         clip.len(),
@@ -836,6 +932,63 @@ fn melody_shape(steps: &[f32])->Vec<f32>{
     .collect()
 }
 
+//Render a midi track as tones so the whole chain -- audio, pitch detection,
+//segmentation, intervals, matching -- can be tested end to end without a
+//microphone or a singer. If this stops identifying its own song, something
+//downstream of the mic has broken.
+fn synth_track(path: &str,notes: usize)->Option<String>{
+    let tracks=load_midi_tracks(path);
+    //Same filter as pick_melody_track: the most monophonic track that a person
+    //could actually sing. Without the range check this picks the bass, which
+    //sits below MIN_FREQ_HZ and yields no pitch at all.
+    let track=tracks.iter()
+    .filter(|t| t.channel!=9 && t.notes.len()>=notes)
+    .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
+    .min_by(|a,b| a.overlap.total_cmp(&b.overlap))?;
+
+    let line=melody_line(&track.notes);
+    let sr=48000u32;
+
+    let clip: Vec<f32>=line.iter().take(notes).enumerate().flat_map(|(i,&key)|{
+        let hz=440.0*2f32.powf((key-69.0)/12.0);
+        let n=(sr as f32*0.38) as usize;
+        let mut state=(i as u32+1).wrapping_mul(2654435761);
+
+        (0..n).map(move |k|{
+            let t=k as f32/sr as f32;
+            //Fade the edges so note boundaries are not clicks, which would
+            //read as broadband noise and wreck the pitch estimate.
+            let env=(t/0.03).min(1.0).min((0.38-t)/0.03).max(0.0);
+            state=state.wrapping_mul(1103515245).wrapping_add(12345);
+            let noise=(((state>>16) as f32/32768.0)-1.0)*0.01;
+            let tp=2.0*std::f32::consts::PI;
+            //A couple of harmonics, so it is not a bare sine.
+            let v=(tp*hz*t).sin()+0.4*(tp*hz*2.0*t).sin()+0.2*(tp*hz*3.0*t).sin();
+            v*0.25*env+noise
+        }).collect::<Vec<f32>>()
+    }).collect();
+
+    std::fs::create_dir_all(TAKES_DIR).ok()?;
+    let out=format!("{TAKES_DIR}/synth.wav");
+    let spec=hound::WavSpec{
+        channels: 1,
+        sample_rate: sr,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut w=hound::WavWriter::create(&out,spec).ok()?;
+    for &v in &clip{ w.write_sample(v).ok()?; }
+    w.finalize().ok()?;
+
+    println!("wrote {out}  ({:.1}s from track {} \"{}\")",
+        clip.len() as f32/sr as f32,track.index,track.name);
+    println!("notes: {}",line.iter().take(notes)
+        .map(|&k| note_name(k)).collect::<Vec<_>>().join(" "));
+
+    Some(out)
+}
+
 //Rank whole songs, not tracks: score every track in every file and let each
 //song's best track stand for it. This is the question recognition actually
 //asks -- with one file the matcher can only rank tracks inside it, and nothing
@@ -852,6 +1005,9 @@ fn match_against_library(dir: &str,query: &[f32]){
     println!("hum shape ({} moves): {}",shape.len(),
         shape.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
 
+    if shape.len()<MIN_USEFUL_MOVES{
+        println!("WARNING: {} moves is below the {MIN_USEFUL_MOVES} needed for a trustworthy result -- a short contour fits almost any song, so treat whatever follows as noise",shape.len());
+    }
 
     let entries=match std::fs::read_dir(dir){
         Ok(e)=>e,
@@ -980,6 +1136,53 @@ const GM_FAMILY: [&str;16]=["Piano","ChromPerc","Organ","Guitar","Bass","Strings
     "Ensemble","Brass","Reed","Pipe","SynthLead","SynthPad","SynthFX","Ethnic",
     "Percussive","SoundFX"];
 
+//Sing the same phrase twice and compare. If two takes of one phrase disagree
+//more than one of them disagrees with a stranger, nothing downstream can work,
+//and the fault is here rather than in the matching.
+fn compare_takes(){
+    println!("take 1 -- sing your phrase");
+    let a=melody_shape(&capture_intervals(None));
+
+    println!();
+    println!("take 2 -- sing the SAME phrase again, the same way");
+    let b=melody_shape(&capture_intervals(None));
+
+    println!();
+    println!("take 1 ({} moves): {}",a.len(),
+        a.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
+    println!("take 2 ({} moves): {}",b.len(),
+        b.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
+
+    if a.len()<3 || b.len()<3{
+        println!("not enough moves to compare");
+        return;
+    }
+
+    let full=dtw(&a,&b);
+
+    //Subsequence needs the shorter side as the query, otherwise there is no
+    //window long enough to hold it and the answer is infinity.
+    let (sub,st,en)=if a.len()<=b.len(){
+        subsequence_dtw(&a,&b)
+    }
+    else{
+        subsequence_dtw(&b,&a)
+    };
+
+    println!("agreement between takes  {full:.4}   (best window {sub:.4} at {st}-{en})");
+    println!("for reference, an unrelated shape scores about 1.0");
+
+    if full<0.35{
+        println!("verdict: reproducible -- the front end is fine");
+    }
+    else if full<0.7{
+        println!("verdict: usable but loose");
+    }
+    else{
+        println!("verdict: NOT reproducible -- matching cannot work until this improves");
+    }
+}
+
 //Take a slice of one song's own melody and ask the library which song it is.
 //A system that works must rank that song first, by a wide margin. No mic
 //needed, so this is the regression test for matching.
@@ -1036,18 +1239,25 @@ fn verify(dir: &str){
 fn main(){
     let args: Vec<String>=std::env::args().skip(1).collect();
 
-    //`cargo run -- selftest`            check the matcher on known answers
-    //`cargo run -- verify`              every song must identify itself
-    //`cargo run -- match <mid|folder>`  hum, then rank tracks or whole songs
-    //`cargo run -- <file.mid>`          inspect a midi without humming
-    //`cargo run`                        hum and print the melody
     match args.first().map(|s| s.as_str()){
+        //`cargo run -- selftest`               check the matcher against
+        //                                      cases with known answers
+        //`cargo run -- match <file.mid>`       hum, then score every track
+        //`cargo run -- <file.mid>`             inspect a midi without humming
+        //`cargo run`                           hum and print the melody
         Some("selftest")=>selftest(),
         Some("verify")=>verify("midi"),
+        Some("synth")=>{
+            match args.get(1){
+                Some(path)=>{ synth_track(path,30); }
+                None=>eprintln!("usage: cargo run -- synth <file.mid>"),
+            }
+        }
+        Some("compare")=>compare_takes(),
         Some("match")=>{
             match args.get(1){
                 Some(path)=>{
-                    let query=capture_intervals();
+                    let query=capture_intervals(args.get(2).map(|s| s.as_str()));
 
                     //A folder means "which song is this"; a file means "which
                     //track of this song did I sing".
@@ -1058,10 +1268,10 @@ fn main(){
                         match_against_midi(path,&query);
                     }
                 }
-                None=>eprintln!("usage: cargo run -- match <file.mid | folder>"),
+                None=>eprintln!("usage: cargo run -- match <file.mid | folder> [take.wav]"),
             }
         }
         Some(path)=>inspect_midi(path),
-        None=>{ capture_intervals(); }
+        None=>{ capture_intervals(None); }
     }
 }

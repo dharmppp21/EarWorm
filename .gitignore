@@ -3,3 +3,6 @@
 
 # downloaded reference midis: commercial songs, not ours to redistribute
 /midi/
+
+# recorded takes: local test data
+/takes/
