@@ -34,8 +34,6 @@ const MAX_GAP_FRAMES: usize=2;
 //A jump this big between neighbouring notes is more likely an octave error
 //than something a person hummed.
 const OCTAVE_JUMP_ST: f32=6.0;
-
-
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
     let mut best: Option<(usize,cpal::Device)>=None;
 
@@ -98,6 +96,13 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     )
     .expect("failed to build input stream");
 
+    //Start the stream *before* the countdown and throw away everything it
+    //captures during it. The first callback after play() has to fault in code
+    //pages and take the mutex for the first time, which takes longer than the
+    //device buffer lasts -- that is the xrun cpal reports. Warming up during
+    //the countdown puts that cost where nobody is singing yet.
+    stream.play().expect("failed to start the stream");
+
     //PrepTime
     println!("get ready to hum....");
     for n in (1..=PREP_SECONDS).rev(){
@@ -106,7 +111,7 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     }
 
     //Recording+reading the result
-    stream.play().expect("failed to start the stream");
+    samples.lock().unwrap().clear();
     println!("recording now! hum something, then press enter when you are done");
     
     let mut input=String::new();
@@ -556,12 +561,165 @@ fn inspect_midi(path: &str){
     }
 }
 
+//--- Matching --------------------------------------------------------------
+
+//Dynamic time warping: the cheapest way to line two sequences up when one has
+//extra or missing entries relative to the other. Every cell asks the same
+//question -- what is the cheapest way to have arrived here -- by taking the
+//best of three moves: consume one from a, one from b, or one from each.
+fn dtw(a: &[f32],b: &[f32])->f32{
+    if a.is_empty() || b.is_empty(){
+        return f32::INFINITY;
+    }
+
+    let n=a.len();
+    let m=b.len();
+
+    //Only the previous row is ever needed, so keep two rows instead of an
+    //n*m grid. Same answer, a fraction of the memory.
+    let mut prev=vec![f32::INFINITY; m+1];
+    let mut curr=vec![f32::INFINITY; m+1];
+    prev[0]=0.0;
+
+    for i in 1..=n{
+        curr[0]=f32::INFINITY;
+
+        for j in 1..=m{
+            let cost=(a[i-1]-b[j-1]).abs();
+            let best=prev[j].min(curr[j-1]).min(prev[j-1]);
+            curr[j]=cost+best;
+        }
+
+        std::mem::swap(&mut prev,&mut curr);
+    }
+
+    //Normalise by path length so sequences of different sizes compare fairly.
+    prev[m] / (n+m) as f32
+}
+
+//Subsequence DTW: the query has to match somewhere *inside* the reference,
+//not stretch across the whole of it. Two changes from plain DTW. The first row
+//is zero everywhere, so beginning at any point in the reference costs nothing.
+//And the answer is the best cell in the last row rather than the far corner,
+//so ending anywhere costs nothing either.
+//Returns the score plus where in the reference the match sits.
+fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
+    if query.is_empty() || reference.len()<query.len(){
+        return (f32::INFINITY,0,0);
+    }
+
+    let n=query.len();
+    let m=reference.len();
+
+    let mut prev=vec![0.0f32; m+1];
+    let mut curr=vec![f32::INFINITY; m+1];
+
+    //Each cell carries the reference position its path began at, so the match
+    //can be located without storing the whole n*m grid to backtrack through.
+    let mut prev_start: Vec<usize>=(0..=m).collect();
+    let mut curr_start=vec![0usize; m+1];
+
+    for i in 1..=n{
+        curr[0]=f32::INFINITY;
+        curr_start[0]=0;
+
+        for j in 1..=m{
+            let cost=(query[i-1]-reference[j-1]).abs();
+
+            //Step through both, skip a reference note, or skip a query note --
+            //whichever arrived here cheapest, inheriting where it started.
+            let mut best=prev[j-1];
+            let mut from=prev_start[j-1];
+
+            if prev[j]<best{ best=prev[j]; from=prev_start[j]; }
+            if curr[j-1]<best{ best=curr[j-1]; from=curr_start[j-1]; }
+
+            curr[j]=cost+best;
+            curr_start[j]=from;
+        }
+
+        std::mem::swap(&mut prev,&mut curr);
+        std::mem::swap(&mut prev_start,&mut curr_start);
+    }
+
+    //Best place to have finished, normalised by how much ground the path
+    //covered so a short accidental alignment cannot undercut a long real one.
+    let mut best_score=f32::INFINITY;
+    let mut best_j=1;
+
+    for j in 1..=m{
+        let span=(j-prev_start[j]).max(1);
+        let score=prev[j] / (n+span) as f32;
+
+        if score<best_score{
+            best_score=score;
+            best_j=j;
+        }
+    }
+
+    (best_score,prev_start[best_j],best_j-1)
+}
+
+//Matching fails quietly -- a wrong implementation still returns a confident
+//number. These cases have known answers, so they catch that.
+fn selftest(){
+    let notes=[60.0f32,62.0,64.0,62.0,60.0,67.0,65.0,64.0];
+    let a=intervals(&notes);
+
+    //Intervals are differences, so moving every note up a fifth changes
+    //nothing. This must be exactly zero.
+    let up: Vec<f32>=notes.iter().map(|n| n+7.0).collect();
+    let a_up=intervals(&up);
+
+    //Sung a little flat and sharp in turn.
+    let sloppy: Vec<f32>=a.iter().enumerate()
+    .map(|(i,&x)| x + if i%2==0{ 0.3 } else { -0.25 })
+    .collect();
+
+    //Warping earns its keep on missed and added notes. Tempo is already
+    //absorbed -- note-level intervals do not care how long a note was held.
+    let mut dropped=notes.to_vec();
+    dropped.remove(4);
+    let a_dropped=intervals(&dropped);
+
+    let mut extra=notes.to_vec();
+    extra.insert(4,63.0);
+    let a_extra=intervals(&extra);
+
+    let other=intervals(&[60.0f32,55.0,67.0,58.0,70.0,52.0,63.0,49.0]);
+
+    println!("dtw self-test  (lower = better match)");
+    println!("  identical              {:.4}",dtw(&a,&a));
+    println!("  transposed up a fifth  {:.4}",dtw(&a,&a_up));
+    println!("  sung slightly off      {:.4}",dtw(&a,&sloppy));
+    println!("  one note missed        {:.4}",dtw(&a,&a_dropped));
+    println!("  one note added         {:.4}",dtw(&a,&a_extra));
+    println!("  unrelated melody       {:.4}",dtw(&a,&other));
+
+    //Subsequence: plant a known melody inside a longer sequence and check it
+    //is found, in the right place, and not found when it is absent.
+    let filler=[3.0f32,-5.0,1.0,7.0,-2.0,-3.0,4.0,6.0,-7.0,2.0,-4.0,5.0];
+    let mut haystack=filler.to_vec();
+    let planted=haystack.len();
+    haystack.extend_from_slice(&a);
+    haystack.extend_from_slice(&filler);
+
+    println!("subsequence self-test  (melody planted at {planted})");
+
+    for (label,q) in [("exact",&a),("sung off",&sloppy),("absent",&other)]{
+        let (cost,start,end)=subsequence_dtw(q,&haystack);
+        println!("  {label:<9} cost {cost:.4}  found at {start}-{end}");
+    }
+}
+
 fn main(){
-    //`cargo run -- midi/balada-gusttavo-lima.mid` inspects a midi file instead
-    //of recording, so the reference side can be worked on without humming.
-    if let Some(path)=std::env::args().nth(1){
-        inspect_midi(&path);
-        return;
+    //`cargo run -- selftest`        check the matcher on cases with known answers
+    //`cargo run -- <file.mid>`      inspect a midi file
+    //`cargo run`                    record and print the melody
+    match std::env::args().nth(1).as_deref(){
+        Some("selftest")=>{ selftest(); return; }
+        Some(path)=>{ inspect_midi(path); return; }
+        None=>{}
     }
 
     let (clip,sample_rate)=record(EXPECTED_MAX_SECONDS);
@@ -599,15 +757,6 @@ fn main(){
 
     let voiced=track.iter().filter(|n| n.is_some()).count();
     println!("{voiced} of {} frames voiced",track.len());
-
-    //Per-frame dump -- useful while tuning the pitch track, far too noisy once
-    //segmentation works. Uncomment to debug a bad take.
-    // for (i,note) in track.iter().enumerate(){
-    //     match note{
-    //         Some(s)=>println!("frame {i}: {s:.2} st  ({})",note_name(*s)),
-    //         None=>println!("frame {i}: --"),
-    //     }
-    // }
 
     let mut notes=segment_notes(&track);
     let fixed=fix_octaves(&mut notes);
