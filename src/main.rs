@@ -24,6 +24,8 @@ const OCTAVE_JUMP_ST: f32=6.0;
 const MIN_MOVE_ST: f32=0.75;
 const MIN_USEFUL_MOVES: usize=12;
 const TAKES_DIR: &str="takes";
+const HUMS_FILE: &str="hums.txt";
+const MIN_USEFUL_HUM_MOVES: usize=5;
 
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
     let mut best: Option<(usize,cpal::Device)>=None;
@@ -782,7 +784,7 @@ fn synth_track(path: &str,notes: usize,want: Option<usize>)->Option<String>{
     Some(out)
 }
 
-fn query_shape(query: &[f32])->Option<Vec<f32>>{
+fn query_shape(query: &[f32],min_useful: usize)->Option<Vec<f32>>{
     let shape=melody_shape(query);
 
     if shape.len()<4{
@@ -793,8 +795,8 @@ fn query_shape(query: &[f32])->Option<Vec<f32>>{
     println!("hum shape ({} moves): {}",shape.len(),
         shape.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
 
-    if shape.len()<MIN_USEFUL_MOVES{
-        println!("WARNING: {} moves is below the {MIN_USEFUL_MOVES} needed for a trustworthy result -- a short contour fits almost any song, so treat whatever follows as noise",shape.len());
+    if shape.len()<min_useful{
+        println!("WARNING: {} moves is below the {min_useful} needed for a trustworthy result -- a short contour fits almost any song, so treat whatever follows as noise",shape.len());
     }
 
     Some(shape)
@@ -816,8 +818,87 @@ fn best_in_file(path: &str,shape: &[f32])->Option<(f32,usize,usize,usize)>{
     best
 }
 
+fn learn_hum(name: &str,query: &[f32]){
+    let Some(shape)=query_shape(query,MIN_USEFUL_HUM_MOVES) else{ return; };
+
+    let line=format!("{name}|{}
+",
+        shape.iter().map(|d| format!("{d:.0}")).collect::<Vec<_>>().join(" "));
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(HUMS_FILE){
+        Ok(mut f)=>{
+            if let Err(e)=f.write_all(line.as_bytes()){
+                eprintln!("could not write {HUMS_FILE}: {e}");
+                return;
+            }
+            println!("learned \"{name}\" ({} moves)",shape.len());
+            println!("hum it again with `recall` to test, or `learn` it more times to improve it");
+        }
+        Err(e)=>eprintln!("could not open {HUMS_FILE}: {e}"),
+    }
+}
+
+fn load_hums()->Vec<(String,Vec<f32>)>{
+    std::fs::read_to_string(HUMS_FILE).unwrap_or_default()
+    .lines()
+    .filter_map(|l|{
+        let (name,moves)=l.split_once('|')?;
+        let shape: Vec<f32>=moves.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if shape.is_empty(){ None } else { Some((name.to_string(),shape)) }
+    })
+    .collect()
+}
+
+fn recall_hum(query: &[f32]){
+    let Some(shape)=query_shape(query,MIN_USEFUL_HUM_MOVES) else{ return; };
+
+    let hums=load_hums();
+    if hums.is_empty(){
+        println!("nothing learned yet -- `cargo run -- learn <name>` first");
+        return;
+    }
+
+    let mut best: std::collections::BTreeMap<String,f32>=Default::default();
+
+    for (name,stored) in &hums{
+        let (cost,_,_)=if shape.len()<=stored.len(){
+            subsequence_dtw(&shape,stored)
+        }
+        else{
+            subsequence_dtw(stored,&shape)
+        };
+
+        let e=best.entry(name.clone()).or_insert(f32::INFINITY);
+        if cost<*e{ *e=cost; }
+    }
+
+    let mut scored: Vec<(f32,String)>=best.into_iter().map(|(n,c)| (c,n)).collect();
+    scored.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+    println!("--- {} learned songs, {} recordings ---",scored.len(),hums.len());
+    for (cost,name) in &scored{
+        println!("  {cost:>7.4}  {name}");
+    }
+
+    if scored.len()>=2{
+        let margin=scored[1].0 / scored[0].0.max(1e-6);
+        println!("best {:.4}, next {:.4} -- {margin:.2}x margin",scored[0].0,scored[1].0);
+
+        if margin<1.5{
+            println!("verdict: no clear match");
+        }
+        else{
+            println!("verdict: {}",scored[0].1);
+        }
+    }
+    else{
+        println!("only one song learned -- nothing to rank against yet");
+    }
+}
+
 fn match_against_library(dir: &str,query: &[f32]){
-    let Some(shape)=query_shape(query) else{ return; };
+    let Some(shape)=query_shape(query,MIN_USEFUL_MOVES) else{ return; };
 
     let entries=match std::fs::read_dir(dir){
         Ok(e)=>e,
@@ -863,7 +944,7 @@ fn match_against_library(dir: &str,query: &[f32]){
 }
 
 fn match_against_midi(path: &str,query: &[f32]){
-    let Some(shape)=query_shape(query) else{ return; };
+    let Some(shape)=query_shape(query,MIN_USEFUL_MOVES) else{ return; };
 
     let tracks=load_midi_tracks(path);
     let mut scored: Vec<(f32,usize,String,usize,usize,usize)>=Vec::new();
@@ -995,6 +1076,19 @@ fn main(){
 
     match args.first().map(|s| s.as_str()){
         Some("selftest")=>selftest(),
+        Some("learn")=>{
+            match args.get(1){
+                Some(name)=>{
+                    let query=capture_intervals(args.get(2).map(|s| s.as_str()));
+                    learn_hum(name,&query);
+                }
+                None=>eprintln!("usage: cargo run -- learn <song name> [take.wav]"),
+            }
+        }
+        Some("recall")=>{
+            let query=capture_intervals(args.get(1).map(|s| s.as_str()));
+            recall_hum(&query);
+        }
         Some("verify")=>verify("midi"),
         Some("synth")=>{
             match args.get(1){

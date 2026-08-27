@@ -77,6 +77,8 @@ Bass, Guitars, Pads and Drums has no tune in it.
 
 ```
 cargo run                              hum, print the melody
+cargo run -- learn <name> [take.wav]   store a hum as a reference
+cargo run -- recall [take.wav]         hum, match against stored hums
 cargo run -- match midi                hum, rank every song in the library
 cargo run -- match midi <take.wav>     rerun a saved take instead of humming
 cargo run -- match <file.mid>          rank the tracks within one song
@@ -119,9 +121,19 @@ independently sourced arrangements of one song, in different keys, rank first
 and second against each other -- transposition invariance confirmed on real
 files rather than synthetic ones.
 
-The open problem is humming accuracy. Real hums flatten intervals, merge
-repeated notes and drop notes, and against an exact MIDI melody all of that
-error sits on one side. Recorded hums are highly reproducible against each
-other (0.08-0.38 where an unrelated shape scores 1.0), which is the direction a
-solution goes: commercial systems match hums against databases of other hums,
-not against MIDI, so both sides carry the same distortions and they cancel.
+Matching a hum against a MIDI melody is the hard version, and it does not work
+well. Real hums flatten intervals, merge repeated notes and drop notes, and
+against an exact melody all of that error sits on one side. Real attempts here
+never cleared a 1.13x margin.
+
+Matching a hum against other hums works, which is what `learn` and `recall` do
+and what commercial systems have always done. Both sides carry the same
+distortions, so they cancel. Measured: two recordings of a phrase stored as a
+reference, then a third recording of it -- never stored -- identified at cost
+0.0769 with a 5.20x margin, on six moves. MIDI matching needs twice that many
+moves and still fails.
+
+So the recogniser has two modes with very different characters. Against a MIDI
+library it can name a song it has never heard hummed, but only from an accurate
+query. Against learned hums it is reliable, but only for songs it has been
+taught. The second is the one that actually works today.

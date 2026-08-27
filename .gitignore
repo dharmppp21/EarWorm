@@ -6,3 +6,6 @@
 
 # recorded takes: local test data
 /takes/
+
+# learned hums: personal recordings
+/hums.txt
