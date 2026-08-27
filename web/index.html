@@ -110,19 +110,30 @@ function staged(arr){
 }
 
 async function loadCorpus(){
-  const r=await fetch("corpus.txt.gz",{cache:"no-store"});
-  if(!r.ok) throw new Error("corpus.txt.gz: HTTP "+r.status);
+  // Two sources on purpose. The gzipped one is a tenth the size, but a browser
+  // shield or extension can block a .gz fetch outright -- it fails as "Failed
+  // to fetch" with no request ever reaching the server. Plain text always gets
+  // through, so fall back to it rather than losing the corpus.
+  let text=null, why=[];
 
-  let text;
   if(typeof DecompressionStream==="function"){
-    text=await new Response(
-      r.body.pipeThrough(new DecompressionStream("gzip"))).text();
-  }else{
-    // Some servers set Content-Encoding and the browser has already unpacked
-    // it; without DecompressionStream that is the only case that can work.
-    text=await r.text();
-    if(text.charCodeAt(0)===0x1f)
-      throw new Error("this browser cannot decompress gzip; serve corpus.txt uncompressed");
+    try{
+      const r=await fetch("corpus.txt.gz",{cache:"no-store"});
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      text=await new Response(
+        r.body.pipeThrough(new DecompressionStream("gzip"))).text();
+    }catch(e){ why.push("corpus.txt.gz: "+e.message); }
+  }
+
+  if(text===null){
+    try{
+      const r=await fetch("corpus.txt",{cache:"no-store"});
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      text=await r.text();
+    }catch(e){
+      why.push("corpus.txt: "+e.message);
+      throw new Error(why.join(" / "));
+    }
   }
 
   wasm.corpus_clear();
@@ -136,7 +147,7 @@ async function loadCorpus(){
     corpus.push(line.slice(0,i));
   }
 
-  if(!corpus.length) throw new Error("corpus file parsed to zero songs");
+  if(!corpus.length) throw new Error("corpus parsed to zero songs");
 }
 
 function searchCorpus(shape){

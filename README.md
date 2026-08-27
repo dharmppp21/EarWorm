@@ -156,11 +156,15 @@ memory as a Float32Array. That keeps the toolchain to one rustup target.
 The corpus works in the browser too. After building `index.txt`:
 
 ```
+cp index.txt web/corpus.txt
 gzip -9 -c index.txt > web/corpus.txt.gz
 ```
 
-10 MB of shapes compress to 1 MB, and the page decompresses them with
-`DecompressionStream`. The corpus is copied into wasm memory once at load, so a
+Both, deliberately. 10 MB of shapes compress to 1 MB and the page unpacks them
+with `DecompressionStream`, but a browser shield or extension can block a `.gz`
+fetch outright -- it surfaces as "Failed to fetch" with no request ever reaching
+the server, which is indistinguishable from a server fault until you read the
+access log. Plain text always gets through, so the page falls back to it. The corpus is copied into wasm memory once at load, so a
 search is a single call rather than fourteen thousand -- about two seconds on a
 laptop.
 
