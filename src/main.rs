@@ -316,11 +316,10 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
     let smf=Smf::parse(&bytes).expect("could not parse midi file");
     let mut infos=Vec::new();
 
-    for (index,track) in smf.tracks.iter().enumerate(){
+    for track in &smf.tracks{
         let mut name=String::new();
-        let mut channel: Option<u8>=None;
-        let mut open: Vec<(u8,u32)>=Vec::new();
-        let mut notes: Vec<MidiNote>=Vec::new();
+        let mut open: Vec<(u8,u8,u32)>=Vec::new();
+        let mut by_channel: std::collections::BTreeMap<u8,Vec<MidiNote>>=Default::default();
         let mut tick: u32=0;
 
         for ev in track{
@@ -330,18 +329,19 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
                 TrackEventKind::Meta(MetaMessage::TrackName(n))=>{
                     name=String::from_utf8_lossy(n).trim().to_string();
                 }
-                TrackEventKind::Midi{channel: ch,message}=>{
-                    channel.get_or_insert(ch.as_int());
+                TrackEventKind::Midi{channel,message}=>{
+                    let ch=channel.as_int();
 
                     match message{
                         MidiMessage::NoteOn{key,vel} if vel.as_int()>0=>{
-                            open.push((key.as_int(),tick));
+                            open.push((ch,key.as_int(),tick));
                         }
                         MidiMessage::NoteOn{key,..}|MidiMessage::NoteOff{key,..}=>{
                             let k=key.as_int();
-                            if let Some(pos)=open.iter().position(|&(ok,_)| ok==k){
-                                let (_,start)=open.remove(pos);
-                                notes.push(MidiNote{key:k,start,end:tick});
+                            if let Some(pos)=open.iter().position(|&(c,ok,_)| c==ch && ok==k){
+                                let (_,_,start)=open.remove(pos);
+                                by_channel.entry(ch).or_default()
+                                .push(MidiNote{key:k,start,end:tick});
                             }
                         }
                         _=>{}
@@ -351,22 +351,24 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
             }
         }
 
-        notes.sort_by_key(|n| n.start);
+        for (channel,mut notes) in by_channel{
+            notes.sort_by_key(|n| n.start);
 
-        let overlaps=notes.windows(2).filter(|w| w[1].start<w[0].end).count();
-        let overlap=if notes.len()>1{ overlaps as f32/(notes.len()-1) as f32 } else { 1.0 };
-        let mean_key=if notes.is_empty(){ 0.0 } else {
-            notes.iter().map(|n| n.key as f32).sum::<f32>() / notes.len() as f32
-        };
+            let overlaps=notes.windows(2).filter(|w| w[1].start<w[0].end).count();
+            let overlap=if notes.len()>1{ overlaps as f32/(notes.len()-1) as f32 } else { 1.0 };
+            let mean_key=if notes.is_empty(){ 0.0 } else {
+                notes.iter().map(|n| n.key as f32).sum::<f32>() / notes.len() as f32
+            };
 
-        infos.push(TrackInfo{
-            index,
-            name,
-            channel: channel.unwrap_or(255),
-            notes,
-            overlap,
-            mean_key,
-        });
+            infos.push(TrackInfo{
+                index: infos.len(),
+                name: name.clone(),
+                channel,
+                notes,
+                overlap,
+                mean_key,
+            });
+        }
     }
 
     infos
@@ -396,30 +398,27 @@ fn melody_line(notes: &[MidiNote])->Vec<f32>{
     line.iter().map(|n| n.key as f32).collect()
 }
 
-fn track_instruments(path: &str)->std::collections::HashMap<usize,String>{
+fn track_instruments(path: &str)->std::collections::HashMap<u8,String>{
     let bytes=std::fs::read(path).expect("could not read midi file");
     let smf=Smf::parse(&bytes).expect("could not parse midi file");
-    let mut out=std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<u8,Vec<u8>>=Default::default();
 
-    for (i,track) in smf.tracks.iter().enumerate(){
-        let mut progs: Vec<u8>=Vec::new();
-
+    for track in &smf.tracks{
         for ev in track{
-            if let TrackEventKind::Midi{message: MidiMessage::ProgramChange{program},..}=ev.kind{
+            if let TrackEventKind::Midi{channel,message: MidiMessage::ProgramChange{program}}=ev.kind{
+                let e=out.entry(channel.as_int()).or_default();
                 let p=program.as_int();
-                if !progs.contains(&p){ progs.push(p); }
+                if !e.contains(&p){ e.push(p); }
             }
-        }
-
-        if !progs.is_empty(){
-            let names: Vec<String>=progs.iter()
-            .map(|&p| format!("{}({p})",GM_FAMILY[(p/8) as usize]))
-            .collect();
-            out.insert(i,names.join(","));
         }
     }
 
-    out
+    out.into_iter().map(|(ch,progs)|{
+        let names: Vec<String>=progs.iter()
+        .map(|&p| format!("{}({p})",GM_FAMILY[(p/8) as usize]))
+        .collect();
+        (ch,names.join(","))
+    }).collect()
 }
 
 fn inspect_midi(path: &str){
@@ -434,7 +433,7 @@ fn inspect_midi(path: &str){
             "  {:<3} {:<18} {:<20} {:>3} {:>6} {:>9.1} {:>7.0}%",
             t.index,
             if t.name.is_empty(){ "-" } else { t.name.as_str() },
-            instruments.get(&t.index).map(|s| s.as_str()).unwrap_or("-"),
+            instruments.get(&t.channel).map(|s| s.as_str()).unwrap_or("-"),
             t.channel,
             t.notes.len(),
             t.mean_key,
