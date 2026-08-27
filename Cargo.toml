@@ -7,4 +7,3 @@ edition = "2024"
 cpal = "0.18.2"
 hound = "3.5.1"
 midly = { version = "0.5.3", default-features = false, features = ["std"] }
-rustfft = "6.4.1"

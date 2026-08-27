@@ -3,47 +3,27 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait,HostTrait,StreamTrait};
 use midly::{Smf,TrackEventKind,MetaMessage,MidiMessage};
-// use rustfft::{FftPlanner, num_complex::Complex}; // only needed by the commented-out spectrogram below
 
-//PrepTime
 const PREP_SECONDS: u64=3;
 const EXPECTED_MAX_SECONDS: u64=30;
-//FFT
 const WINDOW_SIZE: usize=4096;
 const HOP_SIZE: usize=1024;
-//Autocorrelation
 const MIN_FREQ_HZ: f32=80.0;
 const MAX_FREQ_HZ: f32=1400.0;
-//YIN
 const YIN_THRESHOLD: f32=0.25;
-//Mic priority: earlier = better. A mic near your mouth beats a mic across the room.
 const MIC_PREFER: [&str;3]=["jack","earbud","headphone"];
-//Ranks below every unlisted device; earlier = less bad. Bluetooth headset mics
-//negotiate 16 kHz and often stream nothing at all, so they go last.
 const MIC_DEMOTE: [&str;2]=["array","headset"];
 const MIC_REJECT: [&str;2]=["stereo mix","what u hear"];
-//Pitch cleaning
 const VOICED_MAX_CMNDF: f32=0.30;
 const NOTE_NAMES: [&str;12]=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
-//Median filter
 const MEDIAN_WINDOW: usize=5;
-//Note segmentation
 const NOTE_CHANGE_ST: f32=1.0;
 const MIN_NOTE_FRAMES: usize=5;
 const MAX_GAP_FRAMES: usize=2;
-//A jump this big between neighbouring notes is more likely an octave error
-//than something a person hummed.
 const OCTAVE_JUMP_ST: f32=6.0;
-//Matching: anything smaller than this is a repeated note, not a move.
 const MIN_MOVE_ST: f32=0.75;
-//Measured against this library: 7 accurate moves identify a song at ~6.7x
-//margin, 12 at ~24x, 22 at ~56x. A hum is never accurate, so it needs the
-//extra length to make up for it. Below this, expect nothing.
 const MIN_USEFUL_MOVES: usize=12;
-//Every take is kept here. Without fixed audio to re-run, tuning the front end
-//changes the code and the performance at once and neither can be blamed.
 const TAKES_DIR: &str="takes";
-
 
 fn pick_input_device(host: &cpal::Host)->cpal::Device{
     let mut best: Option<(usize,cpal::Device)>=None;
@@ -77,7 +57,6 @@ fn pick_input_device(host: &cpal::Host)->cpal::Device{
 }
 
 fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
-    //Device Config
     let host=cpal::default_host();
     let device=pick_input_device(&host);
     let config=device.default_input_config().expect("no default config");
@@ -86,17 +65,14 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     let channels=config.channels() as usize;
     println!("recording from {device} at {sample_rate} Hz, {channels} channel(s)");
 
-    //Shared Buffer
     let expected_samples=sample_rate as usize*channels*expected_max_seconds as usize;
     let samples=Arc::new(Mutex::new(Vec::<f32>::with_capacity(expected_samples)));
     let samples_for_callback=samples.clone();
 
-    //Error Callback
     let err_fn=move |err|{
         eprintln!("stream error: {err}");
     };
 
-    //Data Callback and stream building
     let stream=device.build_input_stream(
         config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo|{
@@ -107,21 +83,14 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     )
     .expect("failed to build input stream");
 
-    //Start the stream *before* the countdown and throw away everything it
-    //captures during it. The first callback after play() has to fault in code
-    //pages and take the mutex for the first time, which takes longer than the
-    //device buffer lasts -- that is the xrun cpal reports. Warming up during
-    //the countdown puts that cost where nobody is singing yet.
     stream.play().expect("failed to start the stream");
 
-    //PrepTime
     println!("get ready to hum....");
     for n in (1..=PREP_SECONDS).rev(){
         println!("{n}...");
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    //Recording+reading the result
     samples.lock().unwrap().clear();
     println!("recording now! hum something, then press enter when you are done");
     
@@ -139,82 +108,6 @@ fn record(expected_max_seconds: u64)->(Vec<f32>,u32){
     (mono,sample_rate)
 }
 
-// Superseded by autocorrelation-based pitch detection below (track_pitch /
-// detect_pitch_naive) -- kept for reference, not called by main() anymore.
-// Loudest-FFT-bin picking a harmonic instead of the fundamental, and getting
-// dominated by background audio, is exactly what motivated the switch.
-
-// fn hann_window(size: usize)->Vec<f32>{
-//     (0..size)
-//     .map(|n|{
-//         0.5*(1.0 - (2.0 * std::f32::consts::PI * n as f32 / (size-1) as f32).cos())
-//     })
-//     .collect()
-// }
-
-// fn spectogram(samples: &[f32])->Vec<Vec<f32>>{
-//     let window=hann_window(WINDOW_SIZE);
-//     let mut planner=FftPlanner::new();
-//     let fft=planner.plan_fft_forward(WINDOW_SIZE);
-//
-//     let mut frames=Vec::new();
-//     let mut start=0;
-//     while start + WINDOW_SIZE<=samples.len(){
-//         let mut buffer: Vec<Complex<f32>>=samples[start..start+WINDOW_SIZE]
-//         .iter()
-//         .zip(window.iter())
-//         .map(|(&sample,&w)| Complex {re: sample*w,im: 0.0f32})
-//         .collect();
-//
-//         fft.process(&mut buffer);
-//
-//         let half=WINDOW_SIZE/2;
-//         let magnitudes: Vec<f32>=buffer[..=half]
-//         .iter()
-//         .map(|c| (c.re*c.re + c.im*c.im).sqrt())
-//         .collect();
-//
-//         frames.push(magnitudes);
-//         start+=HOP_SIZE;
-//     }
-//
-//     frames
-// }
-
-// Superseded by YIN (detect_pitch_yin below) -- kept for reference, not
-// called by main() anymore. Raw dot-product autocorrelation is structurally
-// biased toward short lags (fewer overlapping terms as lag grows), which
-// showed up as results repeatedly snapping to the two search-range boundaries
-// instead of a real pitch. YIN's normalized difference function fixes that.
-
-// fn autocorrelate_at_lag(frame: &[f32], lag: usize)->f32{
-//     let n=frame.len()-lag;
-//     let mut sum=0.0;
-//     for i in 0..n{
-//         sum+=frame[i]*frame[i+lag];
-//     }
-//     sum
-// }
-//
-// fn detect_pitch_naive(frame: &[f32],sample_rate:u32)->f32{
-//     let min_lag=(sample_rate as f32 / MAX_FREQ_HZ) as usize;
-//     let max_lag=(sample_rate as f32 / MIN_FREQ_HZ) as usize;
-//
-//     let mut best_lag=min_lag;
-//     let mut best_score=f32::MIN;
-//
-//     for lag in min_lag..=max_lag{
-//         let score=autocorrelate_at_lag(frame,lag);
-//         if score>best_score{
-//             best_score=score;
-//             best_lag=lag;
-//         }
-//     }
-//
-//     sample_rate as f32 / best_lag as f32
-// }
-
-//Slide same window for spectogram but estimate pitch not loudness per bin
 fn track_pitch(samples: &[f32],sample_rate:u32)->Vec<(f32,f32)>{
     let mut pitches=Vec::new();
     let mut start=0;
@@ -295,13 +188,9 @@ fn note_name(semitones: f32)->String{
     format!("{name}{octave}")
 }
 
-//A single wrong frame becomes a fake note once we segment, so smooth first.
-//Median not mean: the median only cares about ordering, so one octave-slipped
-//frame out of five can never be the middle value no matter how far off it is.
 fn median_filter(track: &[Option<f32>])->Vec<Option<f32>>{
     (0..track.len())
     .map(|i|{
-        //Smooths pitch; never invents voicing where there was none.
         if track[i].is_none(){
             return None;
         }
@@ -317,15 +206,12 @@ fn median_filter(track: &[Option<f32>])->Vec<Option<f32>>{
     .collect()
 }
 
-//One sung note: its pitch, and which frames it covered.
 struct Note{
     semitones: f32,
     start: usize,
     end: usize,
 }
 
-//Median of the frames collected so far, not the mean -- same reason as the
-//median filter. Drops anything too short to have been sung on purpose.
 fn push_note(notes: &mut Vec<Note>,current: &mut Vec<f32>,start: usize,end: usize){
     if current.len()>=MIN_NOTE_FRAMES{
         current.sort_by(f32::total_cmp);
@@ -338,9 +224,6 @@ fn push_note(notes: &mut Vec<Note>,current: &mut Vec<f32>,start: usize,end: usiz
     current.clear();
 }
 
-//Walk the smoothed track and cut it into notes. A note ends when the pitch
-//moves away from where the note has been sitting, or when the voice stops for
-//long enough that it was not just a dropped frame.
 fn segment_notes(track: &[Option<f32>])->Vec<Note>{
     let mut notes=Vec::new();
     let mut current: Vec<f32>=Vec::new();
@@ -355,9 +238,6 @@ fn segment_notes(track: &[Option<f32>])->Vec<Note>{
                     start=i;
                 }
                 else{
-                    //Compare against the note's running average, not the last
-                    //frame, so slow drift inside a held note does not add up
-                    //into a false boundary.
                     let mean=current.iter().sum::<f32>() / current.len() as f32;
                     if (p-mean).abs()>NOTE_CHANGE_ST{
                         push_note(&mut notes,&mut current,start,end);
@@ -380,15 +260,10 @@ fn segment_notes(track: &[Option<f32>])->Vec<Note>{
         }
     }
 
-    //Whatever is still open when the clip ends is a note too.
     push_note(&mut notes,&mut current,start,end);
     notes
 }
 
-//YIN sometimes locks onto half the true period, which reads as the right note
-//an octave too high. It shows up as a lone note ~12 semitones off its
-//neighbours that immediately returns. Fold those back toward the local line.
-//Heuristic: real hummed leaps bigger than OCTAVE_JUMP_ST are rare.
 fn fix_octaves(notes: &mut [Note])->usize{
     let mut fixed=0;
 
@@ -413,17 +288,12 @@ fn fix_octaves(notes: &mut [Note])->usize{
     fixed
 }
 
-//A melody is the gaps between notes, not the notes themselves. Sing it in any
-//key and every note changes; every gap stays the same. This is what makes
-//matching possible at all.
 fn intervals(pitches: &[f32])->Vec<f32>{
     pitches
     .windows(2)
     .map(|pair| pair[1]-pair[0])
     .collect()
 }
-
-//--- MIDI side: the reference melodies we match against --------------------
 
 #[derive(Clone)]
 struct MidiNote{
@@ -441,9 +311,6 @@ struct TrackInfo{
     mean_key: f32,
 }
 
-//A midi track is a stream of note-on/note-off events separated by delta times.
-//Running totals turn deltas into absolute ticks; pairing each note-on with its
-//matching note-off turns events into notes.
 fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
     let bytes=std::fs::read(path).expect("could not read midi file");
     let smf=Smf::parse(&bytes).expect("could not parse midi file");
@@ -467,7 +334,6 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
                     channel.get_or_insert(ch.as_int());
 
                     match message{
-                        //Velocity 0 on a note-on means note-off, by convention.
                         MidiMessage::NoteOn{key,vel} if vel.as_int()>0=>{
                             open.push((key.as_int(),tick));
                         }
@@ -487,8 +353,6 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
 
         notes.sort_by_key(|n| n.start);
 
-        //How often does a note start before the previous one ended? A sung
-        //melody is nearly monophonic; chords, pads and drums are not.
         let overlaps=notes.windows(2).filter(|w| w[1].start<w[0].end).count();
         let overlap=if notes.len()>1{ overlaps as f32/(notes.len()-1) as f32 } else { 1.0 };
         let mean_key=if notes.is_empty(){ 0.0 } else {
@@ -508,9 +372,6 @@ fn load_midi_tracks(path: &str)->Vec<TrackInfo>{
     infos
 }
 
-//Nothing in a midi file labels the melody, so guess: long enough to be a tune,
-//not channel 9 (drums), inside a range a person could sing, and as close to
-//monophonic as we can find.
 fn pick_melody_track(tracks: &[TrackInfo])->Option<&TrackInfo>{
     tracks
     .iter()
@@ -520,8 +381,6 @@ fn pick_melody_track(tracks: &[TrackInfo])->Option<&TrackInfo>{
     .min_by(|a,b| a.overlap.total_cmp(&b.overlap))
 }
 
-//Flatten whatever overlap remains into a single line. The melody is normally
-//the top voice, so when two notes sound together keep the higher one.
 fn melody_line(notes: &[MidiNote])->Vec<f32>{
     let mut line: Vec<MidiNote>=Vec::new();
 
@@ -537,8 +396,6 @@ fn melody_line(notes: &[MidiNote])->Vec<f32>{
     line.iter().map(|n| n.key as f32).collect()
 }
 
-//What instrument each track is set to, which is how you tell a backing
-//arrangement from one that carries the tune.
 fn track_instruments(path: &str)->std::collections::HashMap<usize,String>{
     let bytes=std::fs::read(path).expect("could not read midi file");
     let smf=Smf::parse(&bytes).expect("could not parse midi file");
@@ -602,12 +459,6 @@ fn inspect_midi(path: &str){
     }
 }
 
-//--- Matching --------------------------------------------------------------
-
-//Dynamic time warping: the cheapest way to line two sequences up when one has
-//extra or missing entries relative to the other. Every cell asks the same
-//question -- what is the cheapest way to have arrived here -- by taking the
-//best of three moves: consume one from a, one from b, or one from each.
 fn dtw(a: &[f32],b: &[f32])->f32{
     if a.is_empty() || b.is_empty(){
         return f32::INFINITY;
@@ -616,8 +467,6 @@ fn dtw(a: &[f32],b: &[f32])->f32{
     let n=a.len();
     let m=b.len();
 
-    //Only the previous row is ever needed, so keep two rows instead of an
-    //n*m grid. Same answer, a fraction of the memory.
     let mut prev=vec![f32::INFINITY; m+1];
     let mut curr=vec![f32::INFINITY; m+1];
     prev[0]=0.0;
@@ -634,16 +483,9 @@ fn dtw(a: &[f32],b: &[f32])->f32{
         std::mem::swap(&mut prev,&mut curr);
     }
 
-    //Normalise by path length so sequences of different sizes compare fairly.
     prev[m] / (n+m) as f32
 }
 
-//Subsequence DTW: the query has to match somewhere *inside* the reference,
-//not stretch across the whole of it. Two changes from plain DTW. The first row
-//is zero everywhere, so beginning at any point in the reference costs nothing.
-//And the answer is the best cell in the last row rather than the far corner,
-//so ending anywhere costs nothing either.
-//Returns the score plus where in the reference the match sits.
 fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
     if query.is_empty() || reference.len()<query.len(){
         return (f32::INFINITY,0,0);
@@ -655,8 +497,6 @@ fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
     let mut prev=vec![0.0f32; m+1];
     let mut curr=vec![f32::INFINITY; m+1];
 
-    //Each cell carries the reference position its path began at, so the match
-    //can be located without storing the whole n*m grid to backtrack through.
     let mut prev_start: Vec<usize>=(0..=m).collect();
     let mut curr_start=vec![0usize; m+1];
 
@@ -667,8 +507,6 @@ fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
         for j in 1..=m{
             let cost=(query[i-1]-reference[j-1]).abs();
 
-            //Step through both, skip a reference note, or skip a query note --
-            //whichever arrived here cheapest, inheriting where it started.
             let mut best=prev[j-1];
             let mut from=prev_start[j-1];
 
@@ -683,8 +521,6 @@ fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
         std::mem::swap(&mut prev_start,&mut curr_start);
     }
 
-    //Best place to have finished, normalised by how much ground the path
-    //covered so a short accidental alignment cannot undercut a long real one.
     let mut best_score=f32::INFINITY;
     let mut best_j=1;
 
@@ -701,24 +537,17 @@ fn subsequence_dtw(query: &[f32],reference: &[f32])->(f32,usize,usize){
     (best_score,prev_start[best_j],best_j-1)
 }
 
-//Matching fails quietly -- a wrong implementation still returns a confident
-//number. These cases have known answers, so they catch that.
 fn selftest(){
     let notes=[60.0f32,62.0,64.0,62.0,60.0,67.0,65.0,64.0];
     let a=intervals(&notes);
 
-    //Intervals are differences, so moving every note up a fifth changes
-    //nothing. This must be exactly zero.
     let up: Vec<f32>=notes.iter().map(|n| n+7.0).collect();
     let a_up=intervals(&up);
 
-    //Sung a little flat and sharp in turn.
     let sloppy: Vec<f32>=a.iter().enumerate()
     .map(|(i,&x)| x + if i%2==0{ 0.3 } else { -0.25 })
     .collect();
 
-    //Warping earns its keep on missed and added notes. Tempo is already
-    //absorbed -- note-level intervals do not care how long a note was held.
     let mut dropped=notes.to_vec();
     dropped.remove(4);
     let a_dropped=intervals(&dropped);
@@ -737,8 +566,6 @@ fn selftest(){
     println!("  one note added         {:.4}",dtw(&a,&a_extra));
     println!("  unrelated melody       {:.4}",dtw(&a,&other));
 
-    //Subsequence: plant a known melody inside a longer sequence and check it
-    //is found, in the right place, and not found when it is absent.
     let filler=[3.0f32,-5.0,1.0,7.0,-2.0,-3.0,4.0,6.0,-7.0,2.0,-4.0,5.0];
     let mut haystack=filler.to_vec();
     let planted=haystack.len();
@@ -753,7 +580,6 @@ fn selftest(){
     }
 }
 
-//32-bit float, so saving and reloading a clip changes nothing about it.
 fn save_take(clip: &[f32],sample_rate: u32)->Option<String>{
     if clip.is_empty(){
         return None;
@@ -761,8 +587,6 @@ fn save_take(clip: &[f32],sample_rate: u32)->Option<String>{
 
     std::fs::create_dir_all(TAKES_DIR).ok()?;
 
-    //Next free number, so takes accumulate into a test set instead of
-    //overwriting each other.
     let mut n=1;
     while std::path::Path::new(&format!("{TAKES_DIR}/take-{n}.wav")).exists(){
         n+=1;
@@ -785,8 +609,6 @@ fn save_take(clip: &[f32],sample_rate: u32)->Option<String>{
     Some(path)
 }
 
-//Accepts any wav -- int or float, any depth, any channel count -- and
-//normalises to the same mono f32 that record() produces.
 fn load_wav(path: &str)->Result<(Vec<f32>,u32),hound::Error>{
     let mut reader=hound::WavReader::open(path)?;
     let spec=reader.spec();
@@ -813,9 +635,6 @@ fn load_wav(path: &str)->Result<(Vec<f32>,u32),hound::Error>{
     Ok((mono,spec.sample_rate))
 }
 
-//Either a fresh performance or a saved one. Passing a wav is what makes
-//tuning measurable: the input is frozen, so any change in output came from
-//the code.
 fn clip_from(source: Option<&str>)->(Vec<f32>,u32){
     match source{
         Some(path)=>{
@@ -840,9 +659,6 @@ fn clip_from(source: Option<&str>)->(Vec<f32>,u32){
     }
 }
 
-//Record, clean, segment, and reduce to the interval sequence -- the melody in
-//the form everything downstream compares. Returns it so matching can use the
-//same pipeline the plain run prints.
 fn capture_intervals(source: Option<&str>)->Vec<f32>{
     let (clip,sample_rate)=clip_from(source);
     println!(
@@ -880,15 +696,6 @@ fn capture_intervals(source: Option<&str>)->Vec<f32>{
     let voiced=track.iter().filter(|n| n.is_some()).count();
     println!("{voiced} of {} frames voiced",track.len());
 
-    //Per-frame dump -- useful while tuning the pitch track, far too noisy once
-    //segmentation works. Uncomment to debug a bad take.
-    // for (i,note) in track.iter().enumerate(){
-    //     match note{
-    //         Some(s)=>println!("frame {i}: {s:.2} st  ({})",note_name(*s)),
-    //         None=>println!("frame {i}: --"),
-    //     }
-    // }
-
     let mut notes=segment_notes(&track);
     let fixed=fix_octaves(&mut notes);
     println!("octave-corrected {fixed} notes");
@@ -917,12 +724,6 @@ fn capture_intervals(source: Option<&str>)->Vec<f32>{
     steps
 }
 
-//Repeated notes carry almost no identifying information -- every track is full
-//of them -- and a hum's come out as fuzzy fractions where a midi's are exact
-//zeros, so comparing them directly just adds noise. Keep only the moves,
-//rounded to whole semitones, which is the alphabet a midi is already written
-//in. Measured on a real take: raw intervals separated the best track from the
-//runner-up by 1.03x, rounding alone 1.22x, moves-only 1.61x.
 fn melody_shape(steps: &[f32])->Vec<f32>{
     steps
     .iter()
@@ -932,15 +733,8 @@ fn melody_shape(steps: &[f32])->Vec<f32>{
     .collect()
 }
 
-//Render a midi track as tones so the whole chain -- audio, pitch detection,
-//segmentation, intervals, matching -- can be tested end to end without a
-//microphone or a singer. If this stops identifying its own song, something
-//downstream of the mic has broken.
 fn synth_track(path: &str,notes: usize)->Option<String>{
     let tracks=load_midi_tracks(path);
-    //Same filter as pick_melody_track: the most monophonic track that a person
-    //could actually sing. Without the range check this picks the bass, which
-    //sits below MIN_FREQ_HZ and yields no pitch at all.
     let track=tracks.iter()
     .filter(|t| t.channel!=9 && t.notes.len()>=notes)
     .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
@@ -956,13 +750,10 @@ fn synth_track(path: &str,notes: usize)->Option<String>{
 
         (0..n).map(move |k|{
             let t=k as f32/sr as f32;
-            //Fade the edges so note boundaries are not clicks, which would
-            //read as broadband noise and wreck the pitch estimate.
             let env=(t/0.03).min(1.0).min((0.38-t)/0.03).max(0.0);
             state=state.wrapping_mul(1103515245).wrapping_add(12345);
             let noise=(((state>>16) as f32/32768.0)-1.0)*0.01;
             let tp=2.0*std::f32::consts::PI;
-            //A couple of harmonics, so it is not a bare sine.
             let v=(tp*hz*t).sin()+0.4*(tp*hz*2.0*t).sin()+0.2*(tp*hz*3.0*t).sin();
             v*0.25*env+noise
         }).collect::<Vec<f32>>()
@@ -989,17 +780,12 @@ fn synth_track(path: &str,notes: usize)->Option<String>{
     Some(out)
 }
 
-//Rank whole songs, not tracks: score every track in every file and let each
-//song's best track stand for it. This is the question recognition actually
-//asks -- with one file the matcher can only rank tracks inside it, and nothing
-//is ever given the chance to lose.
-//Assumes the folder holds valid midis; a corrupt one will panic in parsing.
-fn match_against_library(dir: &str,query: &[f32]){
+fn query_shape(query: &[f32])->Option<Vec<f32>>{
     let shape=melody_shape(query);
 
     if shape.len()<4{
         println!("only {} real moves -- hum a longer or less flat phrase",shape.len());
-        return;
+        return None;
     }
 
     println!("hum shape ({} moves): {}",shape.len(),
@@ -1008,6 +794,28 @@ fn match_against_library(dir: &str,query: &[f32]){
     if shape.len()<MIN_USEFUL_MOVES{
         println!("WARNING: {} moves is below the {MIN_USEFUL_MOVES} needed for a trustworthy result -- a short contour fits almost any song, so treat whatever follows as noise",shape.len());
     }
+
+    Some(shape)
+}
+
+fn best_in_file(path: &str,shape: &[f32])->Option<(f32,usize,usize,usize)>{
+    let mut best: Option<(f32,usize,usize,usize)>=None;
+
+    for t in &load_midi_tracks(path){
+        let refs=melody_shape(&intervals(&melody_line(&t.notes)));
+        if refs.len()<shape.len(){ continue; }
+
+        let (cost,start,end)=subsequence_dtw(shape,&refs);
+        if best.map_or(true,|(b,_,_,_)| cost<b){
+            best=Some((cost,t.index,start,end));
+        }
+    }
+
+    best
+}
+
+fn match_against_library(dir: &str,query: &[f32]){
+    let Some(shape)=query_shape(query) else{ return; };
 
     let entries=match std::fs::read_dir(dir){
         Ok(e)=>e,
@@ -1021,30 +829,10 @@ fn match_against_library(dir: &str,query: &[f32]){
 
     for entry in entries.flatten(){
         let path=entry.path();
-
-        if path.extension().and_then(|e| e.to_str())!=Some("mid"){
-            continue;
-        }
+        if path.extension().and_then(|e| e.to_str())!=Some("mid"){ continue; }
 
         let name=path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let tracks=load_midi_tracks(&path.to_string_lossy());
-        let mut best: Option<(f32,usize,usize,usize)>=None;
-
-        for t in &tracks{
-            let refs=melody_shape(&intervals(&melody_line(&t.notes)));
-
-            if refs.len()<shape.len(){
-                continue;
-            }
-
-            let (cost,start,end)=subsequence_dtw(&shape,&refs);
-
-            if best.map_or(true,|(b,_,_,_)| cost<b){
-                best=Some((cost,t.index,start,end));
-            }
-        }
-
-        if let Some((cost,track,start,end))=best{
+        if let Some((cost,track,start,end))=best_in_file(&path.to_string_lossy(),&shape){
             songs.push((cost,name,track,start,end));
         }
     }
@@ -1072,19 +860,8 @@ fn match_against_library(dir: &str,query: &[f32]){
     }
 }
 
-//Score the hum against every track and rank them. Which track wins answers
-//"did I sing the vocal line or the synth hook" as a result instead of a guess.
-//The gap between best and second is what says whether anything matched at all.
 fn match_against_midi(path: &str,query: &[f32]){
-    let shape=melody_shape(query);
-
-    if shape.len()<4{
-        println!("only {} real moves -- hum a longer or less flat phrase",shape.len());
-        return;
-    }
-
-    println!("hum shape ({} moves): {}",shape.len(),
-        shape.iter().map(|d| format!("{d:+.0}")).collect::<Vec<_>>().join(" "));
+    let Some(shape)=query_shape(query) else{ return; };
 
     let tracks=load_midi_tracks(path);
     let mut scored: Vec<(f32,usize,String,usize,usize,usize)>=Vec::new();
@@ -1111,8 +888,6 @@ fn match_against_midi(path: &str,query: &[f32]){
         println!("  {cost:>7.4}  {index:<4} {name:<14} {len:>6}  {start}-{end}");
     }
 
-    //A real match sits well clear of the field. Bunched scores mean nothing
-    //was recognised, whatever the top row happens to say.
     if scored.len()>=2{
         let best=scored[0].0;
         let next=scored[1].0;
@@ -1129,16 +904,10 @@ fn match_against_midi(path: &str,query: &[f32]){
     }
 }
 
-//General MIDI groups programs in eights. Knowing a track is a Bass or a Flute
-//says more than its note statistics do -- a karaoke file with no lead vocal
-//looks perfectly healthy until you read the instrument list.
 const GM_FAMILY: [&str;16]=["Piano","ChromPerc","Organ","Guitar","Bass","Strings",
     "Ensemble","Brass","Reed","Pipe","SynthLead","SynthPad","SynthFX","Ethnic",
     "Percussive","SoundFX"];
 
-//Sing the same phrase twice and compare. If two takes of one phrase disagree
-//more than one of them disagrees with a stranger, nothing downstream can work,
-//and the fault is here rather than in the matching.
 fn compare_takes(){
     println!("take 1 -- sing your phrase");
     let a=melody_shape(&capture_intervals(None));
@@ -1160,8 +929,6 @@ fn compare_takes(){
 
     let full=dtw(&a,&b);
 
-    //Subsequence needs the shorter side as the query, otherwise there is no
-    //window long enough to hold it and the answer is infinity.
     let (sub,st,en)=if a.len()<=b.len(){
         subsequence_dtw(&a,&b)
     }
@@ -1183,9 +950,6 @@ fn compare_takes(){
     }
 }
 
-//Take a slice of one song's own melody and ask the library which song it is.
-//A system that works must rank that song first, by a wide margin. No mic
-//needed, so this is the regression test for matching.
 fn verify(dir: &str){
     let mut files: Vec<std::path::PathBuf>=std::fs::read_dir(dir).expect("dir")
         .flatten().map(|e| e.path())
@@ -1203,10 +967,6 @@ fn verify(dir: &str){
         let full=melody_shape(&intervals(&melody_line(&bt.notes)));
         if full.len()<30{ continue; }
 
-        //A 20-move slice from the middle, like humming one section -- then
-        //damaged the way a real hum is: two intervals off by a semitone, one
-        //note missed entirely. An exact copy of the melody would only prove
-        //the file loader works.
         let mut query: Vec<f32>=full[full.len()/3..full.len()/3+20].to_vec();
         query[3]+=1.0;
         query[11]-=1.0;
@@ -1214,16 +974,8 @@ fn verify(dir: &str){
 
         let mut scored: Vec<(f32,String)>=Vec::new();
         for f in &files{
-            let ts=load_midi_tracks(&f.to_string_lossy());
-            let mut b=f32::INFINITY;
-            for t in &ts{
-                let refs=melody_shape(&intervals(&melody_line(&t.notes)));
-                if refs.len()<query.len(){ continue; }
-                let (c,_,_)=subsequence_dtw(&query,&refs);
-                if c<b{ b=c; }
-            }
-            if b.is_finite(){
-                scored.push((b,f.file_stem().unwrap().to_string_lossy().to_string()));
+            if let Some((cost,_,_,_))=best_in_file(&f.to_string_lossy(),&query){
+                scored.push((cost,f.file_stem().unwrap().to_string_lossy().to_string()));
             }
         }
         scored.sort_by(|a,b| a.0.total_cmp(&b.0));
@@ -1240,11 +992,6 @@ fn main(){
     let args: Vec<String>=std::env::args().skip(1).collect();
 
     match args.first().map(|s| s.as_str()){
-        //`cargo run -- selftest`               check the matcher against
-        //                                      cases with known answers
-        //`cargo run -- match <file.mid>`       hum, then score every track
-        //`cargo run -- <file.mid>`             inspect a midi without humming
-        //`cargo run`                           hum and print the melody
         Some("selftest")=>selftest(),
         Some("verify")=>verify("midi"),
         Some("synth")=>{
@@ -1259,8 +1006,6 @@ fn main(){
                 Some(path)=>{
                     let query=capture_intervals(args.get(2).map(|s| s.as_str()));
 
-                    //A folder means "which song is this"; a file means "which
-                    //track of this song did I sing".
                     if std::path::Path::new(path).is_dir(){
                         match_against_library(path,&query);
                     }
