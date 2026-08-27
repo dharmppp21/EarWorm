@@ -116,10 +116,15 @@ melody shapes only, no MIDI redistributed -- and the page ranks a hum against
 those as well as against hums you have taught it. Taught hums live in
 localStorage, so they stay on the device.
 
-Only melody-plausible tracks are exported: not channel 9, under 35% polyphony,
-in a singable range. Exporting every track means fifty-odd chances for some
-bass line or pad to contain a similar figure, and a correct query then loses to
-a coincidence. Web Audio supplies the samples at
+Only melody-plausible tracks are matched against, in the browser and on the
+desktop alike: not channel 9, under 35% polyphony, in a singable range. A hum
+is a melody, so scoring it against basses and pads is fifty-odd chances for
+something unrelated to contain a similar figure, and a correct query then loses
+to a coincidence. Applying that filter moved both real recorded hums from
+mid-table to first, and roughly doubled the regression margins.
+
+A file with no melodic track cannot be identified at all, and drops out of the
+tests rather than being scored on its bass line. Web Audio supplies the samples at
 whatever rate the device runs at, which is fine because the measured rate is
 carried through the pipeline rather than assumed.
 

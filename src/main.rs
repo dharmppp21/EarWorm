@@ -522,10 +522,20 @@ fn query_shape(query: &[f32],min_useful: usize)->Option<Vec<f32>>{
     Some(shape)
 }
 
+//A hum is a melody, so only melodies are worth matching against. Scoring every
+//track means fifty-odd chances for some bass line or pad to contain a similar
+//figure by accident, and a correct query then loses to a coincidence. Measured:
+//filtering moved both real takes from mid-table to first.
+fn is_melodic(t: &TrackInfo)->bool{
+    t.channel!=9 && t.overlap<=0.35 && t.mean_key>=48.0 && t.mean_key<=84.0
+}
+
 fn best_in_file(path: &str,shape: &[f32])->Option<(f32,usize,usize,usize)>{
     let mut best: Option<(f32,usize,usize,usize)>=None;
 
     for t in &load_midi_tracks(path){
+        if !is_melodic(t){ continue; }
+
         let refs=melody_shape(&intervals(&melody_line(&t.notes)));
         if refs.len()<shape.len(){ continue; }
 
@@ -559,9 +569,7 @@ fn export_songs(dir: &str,out: &str){
             //Exporting every track -- basses, pads, counter-lines -- means 50-odd
             //chances for some unrelated part to contain a similar figure, and a
             //correct query then loses to a coincidence.
-            if t.channel==9{ continue; }
-            if t.overlap>0.35{ continue; }
-            if t.mean_key<48.0 || t.mean_key>84.0{ continue; }
+            if !is_melodic(t){ continue; }
 
             let shape=melody_shape(&intervals(&melody_line(&t.notes)));
             if shape.len()<MIN_USEFUL_MOVES{ continue; }
@@ -811,7 +819,7 @@ fn verify(dir: &str){
     for probe in &files{
         let tracks=load_midi_tracks(&probe.to_string_lossy());
         let best_track=tracks.iter()
-            .filter(|t| t.channel!=9 && t.notes.len()>=40)
+            .filter(|t| is_melodic(t) && t.notes.len()>=40)
             .min_by(|a,b| a.overlap.total_cmp(&b.overlap));
         let Some(bt)=best_track else{ continue; };
 
