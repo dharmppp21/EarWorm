@@ -93,6 +93,31 @@ Every recording is saved to `takes/`, numbered. Replaying one gives identical
 numbers, which is what makes tuning measurable: with the input frozen, any
 change in the output came from the code.
 
+## Web version
+
+The same Rust runs in a browser, which is also how this reaches a phone: a web
+page gets microphone access with no install, where native Rust on a phone means
+a whole Android or iOS project.
+
+```
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --lib
+cp target/wasm32-unknown-unknown/release/earworm.wasm web/
+python -m http.server 8731 --directory web
+```
+
+No wasm-bindgen and no wasm-pack. The library exports four plain C functions
+and the page instantiates the module directly, passing samples through wasm
+memory as a Float32Array. That keeps the toolchain to one rustup target.
+
+The page does `learn` and `recall` -- the mode that works -- with the database
+in localStorage, so hums stay on the device. Web Audio supplies the samples at
+whatever rate the device runs at, which is fine because the measured rate is
+carried through the pipeline rather than assumed.
+
+It has to be served over http; opening the file directly will not load the wasm,
+and microphone access needs a secure context, which localhost counts as.
+
 ## Testing
 
 Matching fails quietly. A wrong implementation still returns a confident number
@@ -108,6 +133,11 @@ score 0.14-0.27 against 5.5 for an unrelated tune.
 damaged -- two intervals off by a semitone, one note dropped -- and the library
 must still rank that song first. An undamaged copy would only prove the file
 loader works.
+
+The browser build is checked the same way: tones synthesised in JavaScript,
+pushed through the wasm, and the shape compared. A melody transposed up five
+semitones with two notes wrong still matches its original at 0.0714 against
+0.6429 for an unrelated tune.
 
 `synth` covers the whole chain. It renders a MIDI melody as tones, and running
 `match` on that audio exercises everything except the microphone. Fed a real

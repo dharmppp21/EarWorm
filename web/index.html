@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Earworm</title>
+<style>
+:root{
+  --bg:#faf9f7; --fg:#1a1a1a; --dim:#6b6b6b; --line:#e2e0dc;
+  --accent:#c2410c; --good:#15803d; --card:#fff;
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#16150f; --fg:#f0eee9; --dim:#9a968e; --line:#2e2c26;
+         --accent:#fb923c; --good:#4ade80; --card:#1e1d17; }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; padding:24px 18px 60px; background:var(--bg); color:var(--fg);
+  font:16px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;
+  max-width:640px; margin-inline:auto;
+}
+h1{font-size:1.4rem; margin:0 0 2px; letter-spacing:-.02em}
+.sub{color:var(--dim); font-size:.9rem; margin:0 0 28px}
+button{
+  font:inherit; border:1px solid var(--line); background:var(--card); color:var(--fg);
+  border-radius:10px; padding:12px 16px; cursor:pointer;
+}
+button:disabled{opacity:.45; cursor:default}
+#rec{
+  width:100%; padding:26px; font-size:1.1rem; font-weight:600;
+  border-color:var(--accent); color:var(--accent);
+}
+#rec.on{background:var(--accent); color:var(--bg); border-color:var(--accent)}
+.row{display:flex; gap:8px; margin-top:14px}
+.row button{flex:1}
+input{
+  font:inherit; width:100%; padding:12px; margin-top:14px; border-radius:10px;
+  border:1px solid var(--line); background:var(--card); color:var(--fg);
+}
+#out{margin-top:24px}
+.shape{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85rem;
+  color:var(--dim); word-break:break-word; margin:10px 0 18px;
+}
+table{width:100%; border-collapse:collapse; font-size:.92rem}
+td{padding:7px 0; border-bottom:1px solid var(--line)}
+td.n{text-align:right; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim)}
+tr.top td{color:var(--good); font-weight:600}
+.verdict{margin-top:16px; font-weight:600}
+.warn{color:var(--accent)}
+.note{color:var(--dim); font-size:.85rem; margin-top:8px}
+h2{font-size:.8rem; text-transform:uppercase; letter-spacing:.08em;
+   color:var(--dim); margin:34px 0 6px; font-weight:600}
+</style>
+</head>
+<body>
+
+<h1>Earworm</h1>
+<p class="sub">Hum a tune. Teach it once, then it knows it.</p>
+
+<button id="rec" disabled>loading…</button>
+
+<input id="name" placeholder="Song name — fill in to teach, leave blank to identify">
+
+<div class="row">
+  <button id="clear">Forget all</button>
+</div>
+
+<div id="out"></div>
+
+<h2>Learned</h2>
+<div id="known" class="note">nothing yet</div>
+
+<script>
+const KEY="earworm.hums";
+const MIN_MOVES=5;
+
+let wasm=null, ctx=null, stream=null, node=null, chunks=[], recording=false;
+
+const $=id=>document.getElementById(id);
+const db=()=>{ try{ return JSON.parse(localStorage.getItem(KEY))||[] }catch{ return [] } };
+const save=v=>{ try{ localStorage.setItem(KEY,JSON.stringify(v)) }catch{} };
+
+function showKnown(){
+  const names=[...new Set(db().map(e=>e.name))];
+  $("known").textContent=names.length
+    ? names.map(n=>`${n} (${db().filter(e=>e.name===n).length})`).join(" · ")
+    : "nothing yet";
+}
+
+// The wasm exports raw pointers, no bindgen. memory.buffer can be replaced when
+// the heap grows, so every view is taken fresh after a call that may allocate.
+function put(arr){
+  const p=wasm.alloc(arr.length);
+  new Float32Array(wasm.memory.buffer,p,arr.length).set(arr);
+  return p;
+}
+
+function shapeOf(samples,rate){
+  const p=put(samples);
+  const n=wasm.analyse(p,samples.length,rate);
+  if(!n) return [];
+  return Array.from(new Float32Array(wasm.memory.buffer,wasm.shape_ptr(),n));
+}
+
+function distance(a,b){
+  const pa=put(a), pb=put(b);
+  return wasm.compare(pa,a.length,pb,b.length);
+}
+
+async function start(){
+  stream=await navigator.mediaDevices.getUserMedia({audio:{
+    echoCancellation:false, noiseSuppression:false, autoGainControl:false
+  }});
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  const src=ctx.createMediaStreamSource(stream);
+  // ponytail: ScriptProcessor is deprecated but works everywhere including
+  // mobile Safari. Move to AudioWorklet if a browser actually drops it.
+  node=ctx.createScriptProcessor(4096,1,1);
+  chunks=[];
+  node.onaudioprocess=e=>chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(node); node.connect(ctx.destination);
+}
+
+function stop(){
+  if(node){ node.disconnect(); node.onaudioprocess=null; node=null; }
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  const total=chunks.reduce((n,c)=>n+c.length,0);
+  const all=new Float32Array(total);
+  let o=0; for(const c of chunks){ all.set(c,o); o+=c.length; }
+  const rate=ctx? ctx.sampleRate : 48000;
+  if(ctx){ ctx.close(); ctx=null; }
+  return {samples:all,rate};
+}
+
+function rms(a){
+  let s=0; for(let i=0;i<a.length;i++) s+=a[i]*a[i];
+  return Math.sqrt(s/(a.length||1));
+}
+
+function render(shape,level,rows,verdict,cls){
+  const fmt=shape.map(d=>(d>0?"+":"")+d.toFixed(0)).join(" ");
+  let html=`<div class="shape">${shape.length} moves &middot; level ${level.toFixed(3)}<br>${fmt}</div>`;
+  if(rows) html+=`<table>${rows}</table>`;
+  if(verdict) html+=`<div class="verdict ${cls||""}">${verdict}</div>`;
+  $("out").innerHTML=html;
+}
+
+async function finish(){
+  const {samples,rate}=stop();
+  const level=rms(samples);
+
+  if(samples.length<rate*1.5){
+    $("out").innerHTML=`<div class="verdict warn">Too short — hum for a few seconds.</div>`;
+    return;
+  }
+
+  const shape=shapeOf(samples,rate);
+
+  if(shape.length<MIN_MOVES){
+    render(shape,level,"",
+      `Only ${shape.length} moves — hum a longer phrase, and let the pitch move.`,"warn");
+    return;
+  }
+
+  const name=$("name").value.trim();
+
+  if(name){
+    const all=db(); all.push({name,shape});
+    save(all); showKnown();
+    render(shape,level,"",`Learned “${name}”. Hum it again with the name box empty.`,"");
+    $("name").value="";
+    return;
+  }
+
+  const all=db();
+  if(!all.length){
+    render(shape,level,"","Nothing learned yet — type a song name first, then hum it.","warn");
+    return;
+  }
+
+  const best=new Map();
+  for(const e of all){
+    const d=distance(shape,e.shape);
+    if(!best.has(e.name)||d<best.get(e.name)) best.set(e.name,d);
+  }
+
+  const ranked=[...best].sort((a,b)=>a[1]-b[1]);
+  const rows=ranked.map(([n,d],i)=>
+    `<tr class="${i===0?"top":""}"><td>${n}</td><td class="n">${d.toFixed(4)}</td></tr>`).join("");
+
+  let verdict,cls;
+  if(ranked.length<2){
+    verdict=ranked[0][1]<0.35? `That's ${ranked[0][0]}.` : "No clear match.";
+    cls=ranked[0][1]<0.35? "" : "warn";
+  }else{
+    const margin=ranked[1][1]/Math.max(ranked[0][1],1e-6);
+    verdict=margin<1.5
+      ? `No clear match — the field is bunched (${margin.toFixed(2)}×).`
+      : `That's ${ranked[0][0]} (${margin.toFixed(2)}× clear).`;
+    cls=margin<1.5? "warn":"";
+  }
+  render(shape,level,rows,verdict,cls);
+}
+
+$("rec").onclick=async()=>{
+  const b=$("rec");
+  if(!recording){
+    try{ await start(); }
+    catch(e){ $("out").innerHTML=`<div class="verdict warn">No microphone: ${e.message}</div>`; return; }
+    recording=true; b.textContent="Stop"; b.classList.add("on");
+  }else{
+    recording=false; b.textContent="Hum"; b.classList.remove("on");
+    await finish();
+  }
+};
+
+$("clear").onclick=()=>{
+  if(confirm("Forget every learned hum?")){ save([]); showKnown(); $("out").innerHTML=""; }
+};
+
+(async()=>{
+  try{
+    const r=await fetch("earworm.wasm");
+    const {instance}=await WebAssembly.instantiate(await r.arrayBuffer(),{});
+    wasm=instance.exports;
+    $("rec").disabled=false; $("rec").textContent="Hum";
+  }catch(e){
+    $("rec").textContent="failed to load";
+    $("out").innerHTML=`<div class="verdict warn">Could not load earworm.wasm: ${e.message}<br>
+    Serve this folder over http — opening the file directly will not work.</div>`;
+  }
+  showKnown();
+})();
+</script>
+</body>
+</html>

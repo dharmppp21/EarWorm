@@ -9,3 +9,6 @@
 
 # learned hums: personal recordings
 /hums.txt
+
+# wasm build artefact -- see README for the build command
+web/*.wasm
