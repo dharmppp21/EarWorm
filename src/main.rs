@@ -733,12 +733,15 @@ fn melody_shape(steps: &[f32])->Vec<f32>{
     .collect()
 }
 
-fn synth_track(path: &str,notes: usize)->Option<String>{
+fn synth_track(path: &str,notes: usize,want: Option<usize>)->Option<String>{
     let tracks=load_midi_tracks(path);
-    let track=tracks.iter()
-    .filter(|t| t.channel!=9 && t.notes.len()>=notes)
-    .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
-    .min_by(|a,b| a.overlap.total_cmp(&b.overlap))?;
+    let track=match want{
+        Some(i)=>tracks.iter().find(|t| t.index==i)?,
+        None=>tracks.iter()
+        .filter(|t| t.channel!=9 && t.notes.len()>=notes)
+        .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
+        .min_by(|a,b| a.overlap.total_cmp(&b.overlap))?,
+    };
 
     let line=melody_line(&track.notes);
     let sr=48000u32;
@@ -996,8 +999,11 @@ fn main(){
         Some("verify")=>verify("midi"),
         Some("synth")=>{
             match args.get(1){
-                Some(path)=>{ synth_track(path,30); }
-                None=>eprintln!("usage: cargo run -- synth <file.mid>"),
+                Some(path)=>{
+                    let want=args.get(2).and_then(|s| s.parse().ok());
+                    synth_track(path,30,want);
+                }
+                None=>eprintln!("usage: cargo run -- synth <file.mid> [track]"),
             }
         }
         Some("compare")=>compare_takes(),
