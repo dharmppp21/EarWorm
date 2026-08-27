@@ -538,6 +538,54 @@ fn best_in_file(path: &str,shape: &[f32])->Option<(f32,usize,usize,usize)>{
     best
 }
 
+fn export_songs(dir: &str,out: &str){
+    let Ok(entries)=std::fs::read_dir(dir) else{
+        eprintln!("could not read {dir}");
+        return;
+    };
+
+    let mut json=String::from("[
+");
+    let mut first=true;
+
+    for entry in entries.flatten(){
+        let path=entry.path();
+        if path.extension().and_then(|e| e.to_str())!=Some("mid"){ continue; }
+
+        let name=path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+
+        for t in &load_midi_tracks(&path.to_string_lossy()){
+            //A hum is a melody, so only melodies are worth matching against.
+            //Exporting every track -- basses, pads, counter-lines -- means 50-odd
+            //chances for some unrelated part to contain a similar figure, and a
+            //correct query then loses to a coincidence.
+            if t.channel==9{ continue; }
+            if t.overlap>0.35{ continue; }
+            if t.mean_key<48.0 || t.mean_key>84.0{ continue; }
+
+            let shape=melody_shape(&intervals(&melody_line(&t.notes)));
+            if shape.len()<MIN_USEFUL_MOVES{ continue; }
+
+            if !first{ json.push_str(",
+"); }
+            first=false;
+
+            let moves: Vec<String>=shape.iter().map(|d| format!("{d:.0}")).collect();
+            json.push_str(&format!("  {{\"song\":\"{}\",\"track\":{},\"shape\":[{}]}}",
+                name.replace('"',"'"),t.index,moves.join(",")));
+        }
+    }
+
+    json.push_str("
+]
+");
+
+    match std::fs::write(out,&json){
+        Ok(())=>println!("wrote {out} ({} bytes)",json.len()),
+        Err(e)=>eprintln!("could not write {out}: {e}"),
+    }
+}
+
 fn learn_hum(name: &str,query: &[f32]){
     let Some(shape)=query_shape(query,MIN_USEFUL_HUM_MOVES) else{ return; };
 
@@ -810,6 +858,7 @@ fn main(){
             recall_hum(&query);
         }
         Some("verify")=>verify("midi"),
+        Some("export")=>export_songs("midi",args.get(1).map(|s| s.as_str()).unwrap_or("web/songs.json")),
         Some("synth")=>{
             match args.get(1){
                 Some(path)=>{

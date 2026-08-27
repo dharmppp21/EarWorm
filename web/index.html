@@ -75,7 +75,7 @@ h2{font-size:.8rem; text-transform:uppercase; letter-spacing:.08em;
 const KEY="earworm.hums";
 const MIN_MOVES=5;
 
-let wasm=null, ctx=null, stream=null, node=null, chunks=[], recording=false;
+let wasm=null, ctx=null, stream=null, node=null, chunks=[], recording=false, songs=[];
 
 const $=id=>document.getElementById(id);
 const db=()=>{ try{ return JSON.parse(localStorage.getItem(KEY))||[] }catch{ return [] } };
@@ -83,9 +83,12 @@ const save=v=>{ try{ localStorage.setItem(KEY,JSON.stringify(v)) }catch{} };
 
 function showKnown(){
   const names=[...new Set(db().map(e=>e.name))];
-  $("known").textContent=names.length
-    ? names.map(n=>`${n} (${db().filter(e=>e.name===n).length})`).join(" · ")
-    : "nothing yet";
+  const songCount=new Set(songs.map(s=>s.song)).size;
+  $("known").textContent=
+    (songCount? `${songCount} songs from MIDI. ` : "")+
+    (names.length
+      ? "Your hums: "+names.map(n=>`${n} (${db().filter(e=>e.name===n).length})`).join(" · ")
+      : "No hums taught yet.");
 }
 
 // The wasm exports raw pointers, no bindgen. memory.buffer can be replaced when
@@ -173,34 +176,49 @@ async function finish(){
     return;
   }
 
-  const all=db();
-  if(!all.length){
-    render(shape,level,"","Nothing learned yet — type a song name first, then hum it.","warn");
-    return;
+  const rank=entries=>{
+    const best=new Map();
+    for(const e of entries){
+      const d=distance(shape,e.shape);
+      if(!best.has(e.name)||d<best.get(e.name)) best.set(e.name,d);
+    }
+    return [...best].sort((a,b)=>a[1]-b[1]);
+  };
+
+  const table=r=>`<table>${r.slice(0,6).map(([n,d],i)=>
+    `<tr class="${i===0?"top":""}"><td>${n}</td><td class="n">${d.toFixed(4)}</td></tr>`).join("")}</table>`;
+
+  const call=r=>{
+    if(!r.length) return ["",""];
+    if(r.length<2) return r[0][1]<0.35? [`That's ${r[0][0]}.`,""] : ["No clear match.","warn"];
+    const m=r[1][1]/Math.max(r[0][1],1e-6);
+    return m<1.5
+      ? [`No clear match — the field is bunched (${m.toFixed(2)}×).`,"warn"]
+      : [`That's ${r[0][0]} (${m.toFixed(2)}× clear).`,""];
+  };
+
+  const fmt=shape.map(d=>(d>0?"+":"")+d.toFixed(0)).join(" ");
+  let html=`<div class="shape">${shape.length} moves &middot; level ${level.toFixed(3)}<br>${fmt}</div>`;
+
+  const songRank=rank(songs.map(s=>({name:s.song,shape:s.shape})));
+  if(songRank.length){
+    const [v,c]=call(songRank);
+    html+=`<h2>Songs</h2>${table(songRank)}<div class="verdict ${c}">${v}</div>`;
+    if(shape.length<12) html+=`<div class="note warn">Under 12 moves — too short to trust against songs.</div>`;
+    html+=`<div class="note">Matching a hum against a written melody is the unreliable
+      direction: your hum flattens and merges notes while the score is exact.
+      Teach it a hum instead and it becomes far more certain.</div>`;
   }
 
-  const best=new Map();
-  for(const e of all){
-    const d=distance(shape,e.shape);
-    if(!best.has(e.name)||d<best.get(e.name)) best.set(e.name,d);
+  const humRank=rank(db());
+  if(humRank.length){
+    const [v,c]=call(humRank);
+    html+=`<h2>Your hums</h2>${table(humRank)}<div class="verdict ${c}">${v}</div>`;
+  }else if(!songRank.length){
+    html=`<div class="verdict warn">Nothing to match against.</div>`;
   }
 
-  const ranked=[...best].sort((a,b)=>a[1]-b[1]);
-  const rows=ranked.map(([n,d],i)=>
-    `<tr class="${i===0?"top":""}"><td>${n}</td><td class="n">${d.toFixed(4)}</td></tr>`).join("");
-
-  let verdict,cls;
-  if(ranked.length<2){
-    verdict=ranked[0][1]<0.35? `That's ${ranked[0][0]}.` : "No clear match.";
-    cls=ranked[0][1]<0.35? "" : "warn";
-  }else{
-    const margin=ranked[1][1]/Math.max(ranked[0][1],1e-6);
-    verdict=margin<1.5
-      ? `No clear match — the field is bunched (${margin.toFixed(2)}×).`
-      : `That's ${ranked[0][0]} (${margin.toFixed(2)}× clear).`;
-    cls=margin<1.5? "warn":"";
-  }
-  render(shape,level,rows,verdict,cls);
+  $("out").innerHTML=html;
 }
 
 $("rec").onclick=async()=>{
@@ -220,6 +238,10 @@ $("clear").onclick=()=>{
 };
 
 (async()=>{
+  try{
+    songs=await (await fetch("songs.json")).json();
+  }catch{ songs=[]; }
+
   try{
     const r=await fetch("earworm.wasm");
     const {instance}=await WebAssembly.instantiate(await r.arrayBuffer(),{});

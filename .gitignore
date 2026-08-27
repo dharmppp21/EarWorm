@@ -12,3 +12,6 @@
 
 # wasm build artefact -- see README for the build command
 web/*.wasm
+
+# generated from midi/ -- see README
+web/songs.json

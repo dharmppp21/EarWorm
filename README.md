@@ -85,6 +85,7 @@ cargo run -- match <file.mid>          rank the tracks within one song
 cargo run -- <file.mid>                inspect tracks and instruments
 cargo run -- synth <file.mid> [track]  render a melody to audio
 cargo run -- compare                   hum twice, measure agreement
+cargo run -- export [out.json]         melody shapes for the web version
 cargo run -- selftest                  matching, against known answers
 cargo run -- verify                    every song must identify itself
 ```
@@ -110,8 +111,15 @@ No wasm-bindgen and no wasm-pack. The library exports four plain C functions
 and the page instantiates the module directly, passing samples through wasm
 memory as a Float32Array. That keeps the toolchain to one rustup target.
 
-The page does `learn` and `recall` -- the mode that works -- with the database
-in localStorage, so hums stay on the device. Web Audio supplies the samples at
+The page does both modes. `cargo run -- export` writes `web/songs.json` --
+melody shapes only, no MIDI redistributed -- and the page ranks a hum against
+those as well as against hums you have taught it. Taught hums live in
+localStorage, so they stay on the device.
+
+Only melody-plausible tracks are exported: not channel 9, under 35% polyphony,
+in a singable range. Exporting every track means fifty-odd chances for some
+bass line or pad to contain a similar figure, and a correct query then loses to
+a coincidence. Web Audio supplies the samples at
 whatever rate the device runs at, which is fine because the measured rate is
 carried through the pipeline rather than assumed.
 
