@@ -456,12 +456,14 @@ fn capture_intervals(source: Option<&str>)->Vec<f32>{
 
 fn synth_track(path: &str,notes: usize,want: Option<usize>)->Option<String>{
     let tracks=load_midi_tracks(path);
+    //Same choice the index makes -- the longest melodic line -- so what you
+    //hear is what would actually be matched against. Picking differently here
+    //means previewing a track the index never stored.
     let track=match want{
         Some(i)=>tracks.iter().find(|t| t.index==i)?,
         None=>tracks.iter()
-        .filter(|t| t.channel!=9 && t.notes.len()>=notes)
-        .filter(|t| t.mean_key>=45.0 && t.mean_key<=84.0)
-        .min_by(|a,b| a.overlap.total_cmp(&b.overlap))?,
+        .filter(|t| is_melodic(t))
+        .max_by_key(|t| melody_shape(&intervals(&melody_line(&t.notes))).len())?,
     };
 
     let line=melody_line(&track.notes);
@@ -1060,7 +1062,11 @@ fn main(){
             match args.get(1){
                 Some(path)=>{
                     let want=args.get(2).and_then(|s| s.parse().ok());
-                    synth_track(path,30,want);
+                    //Silence here left the previous synth.wav in place, so a
+                    //batch test happily measured the wrong song. Say so.
+                    if synth_track(path,30,want).is_none(){
+                        eprintln!("{path}: no melodic track to render");
+                    }
                 }
                 None=>eprintln!("usage: cargo run -- synth <file.mid> [track]"),
             }
