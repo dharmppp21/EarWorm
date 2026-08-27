@@ -110,10 +110,20 @@ function staged(arr){
 }
 
 async function loadCorpus(){
-  const r=await fetch("corpus.txt.gz");
-  if(!r.ok) return;
-  const text=await new Response(
-    r.body.pipeThrough(new DecompressionStream("gzip"))).text();
+  const r=await fetch("corpus.txt.gz",{cache:"no-store"});
+  if(!r.ok) throw new Error("corpus.txt.gz: HTTP "+r.status);
+
+  let text;
+  if(typeof DecompressionStream==="function"){
+    text=await new Response(
+      r.body.pipeThrough(new DecompressionStream("gzip"))).text();
+  }else{
+    // Some servers set Content-Encoding and the browser has already unpacked
+    // it; without DecompressionStream that is the only case that can work.
+    text=await r.text();
+    if(text.charCodeAt(0)===0x1f)
+      throw new Error("this browser cannot decompress gzip; serve corpus.txt uncompressed");
+  }
 
   wasm.corpus_clear();
   corpus=[];
@@ -125,6 +135,8 @@ async function loadCorpus(){
     wasm.corpus_add(staged(shape),shape.length);
     corpus.push(line.slice(0,i));
   }
+
+  if(!corpus.length) throw new Error("corpus file parsed to zero songs");
 }
 
 function searchCorpus(shape){
@@ -294,7 +306,16 @@ $("clear").onclick=()=>{
     const {instance}=await WebAssembly.instantiate(await r.arrayBuffer(),{});
     wasm=instance.exports;
     $("rec").textContent="loading songs…";
-    try{ await loadCorpus(); }catch(e){ console.warn("corpus:",e); }
+    try{
+      await loadCorpus();
+    }catch(e){
+      // Silent failure here looks identical to "no corpus configured", which
+      // is exactly the confusion worth avoiding.
+      $("out").innerHTML=`<div class="verdict warn">Song corpus did not load:
+        ${e.message}</div><div class="note">The nine files in your midi/ folder
+        still work. Rebuild with <code>gzip -9 -c index.txt &gt; web/corpus.txt.gz</code>
+        and hard-refresh with Ctrl+Shift+R.</div>`;
+    }
     $("rec").disabled=false; $("rec").textContent="Hum";
   }catch(e){
     $("rec").textContent="failed to load";
