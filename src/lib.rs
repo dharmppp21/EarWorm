@@ -349,3 +349,54 @@ pub extern "C" fn compare(a: *const f32,alen: usize,b: *const f32,blen: usize)->
 
     if x.len()<=y.len(){ subsequence_dtw(x,y).0 } else { subsequence_dtw(y,x).0 }
 }
+
+static mut CORPUS: Vec<Vec<f32>>=Vec::new();
+static mut RESULTS: [f32;20]=[0.0;20];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn corpus_clear(){
+    unsafe{ (*&raw mut CORPUS).clear(); }
+}
+
+/// Copy one song's shape in. Keeping the corpus inside wasm means a search is
+/// one call instead of fourteen thousand, and nothing is allocated per query.
+#[unsafe(no_mangle)]
+pub extern "C" fn corpus_add(ptr: *const f32,len: usize)->usize{
+    let s=unsafe{ std::slice::from_raw_parts(ptr,len) }.to_vec();
+    unsafe{
+        let c=&mut *&raw mut CORPUS;
+        c.push(s);
+        c.len()-1
+    }
+}
+
+/// Score the query against everything stored. Writes the best ten as
+/// (index, cost) pairs into RESULTS and returns how many were written.
+#[unsafe(no_mangle)]
+pub extern "C" fn search(ptr: *const f32,len: usize)->usize{
+    let q=unsafe{ std::slice::from_raw_parts(ptr,len) };
+    let corpus=unsafe{ &*&raw const CORPUS };
+
+    let mut scored: Vec<(f32,usize)>=corpus.iter().enumerate()
+    .filter(|(_,s)| s.len()>=q.len())
+    .map(|(i,s)| (subsequence_dtw(q,s).0,i))
+    .collect();
+
+    scored.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+    let n=scored.len().min(10);
+    unsafe{
+        let r=&mut *&raw mut RESULTS;
+        for k in 0..n{
+            r[k*2]=scored[k].1 as f32;
+            r[k*2+1]=scored[k].0;
+        }
+    }
+
+    n
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn results_ptr()->*const f32{
+    &raw const RESULTS as *const f32
+}

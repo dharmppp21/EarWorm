@@ -20,3 +20,5 @@ web/songs.json
 /corpus/
 
 /index.txt
+
+web/corpus.txt.gz

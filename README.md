@@ -153,6 +153,17 @@ No wasm-bindgen and no wasm-pack. The library exports four plain C functions
 and the page instantiates the module directly, passing samples through wasm
 memory as a Float32Array. That keeps the toolchain to one rustup target.
 
+The corpus works in the browser too. After building `index.txt`:
+
+```
+gzip -9 -c index.txt > web/corpus.txt.gz
+```
+
+10 MB of shapes compress to 1 MB, and the page decompresses them with
+`DecompressionStream`. The corpus is copied into wasm memory once at load, so a
+search is a single call rather than fourteen thousand -- about two seconds on a
+laptop.
+
 The page does both modes. `cargo run -- export` writes `web/songs.json` --
 melody shapes only, no MIDI redistributed -- and the page ranks a hum against
 those as well as against hums you have taught it. Taught hums live in
