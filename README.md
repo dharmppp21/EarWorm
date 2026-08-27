@@ -73,6 +73,45 @@ That prints every track with its instrument and how polyphonic it is. A melody
 track is nearly monophonic and sits in a singable range. A file showing only
 Bass, Guitars, Pads and Drums has no tune in it.
 
+## Universal coverage
+
+A handful of MIDI files only recognises a handful of songs. For real coverage,
+point it at the Lakh MIDI Dataset's `clean_midi` subset -- about 17,000 files
+laid out as `Artist/Title.mid`, which is the part that matters, since a corpus
+of hashed filenames can rank a song but never name it.
+
+```
+curl -o clean_midi.tar.gz http://hog.ee.columbia.edu/craffel/lmd/clean_midi.tar.gz
+tar xzf clean_midi.tar.gz -C corpus/
+cargo build --release
+./target/release/earworm index corpus/clean_midi index.txt
+./target/release/earworm find index.txt
+```
+
+Indexing parses every file once and keeps the longest melodic line per song, so
+searching is a second rather than minutes. Use the release build: the debug
+build is roughly an order of magnitude slower at this size.
+
+Measured on the full corpus, with queries damaged the way a hum is -- two
+intervals off by a semitone, one note dropped:
+
+```
+12-move query: rank1 50%  top10 70%  mean margin 1.36x
+16-move query: rank1 68%  top10 88%  mean margin 1.77x
+20-move query: rank1 77%  top10 97%  mean margin 2.47x
+26-move query: rank1 86%  top10 97%  mean margin 3.41x
+34-move query: rank1 86%  top10 98%  mean margin 3.75x
+```
+
+`verify-index` runs that. Query length is the whole story: a dozen moves is a
+coin flip against 14,700 songs, while twenty-six lands the right song first
+86% of the time and in the top ten 97% of the time. Hum longer.
+
+Scale cuts both ways. Thousands of unrelated melodies each get a chance to
+contain a figure like yours, so a margin that would be convincing against ten
+songs means nothing against ten thousand. `find` therefore demands 2.0x rather
+than the 1.5x used for a small library, and says so when it will not commit.
+
 ## Usage
 
 ```
@@ -85,6 +124,9 @@ cargo run -- match <file.mid>          rank the tracks within one song
 cargo run -- <file.mid>                inspect tracks and instruments
 cargo run -- synth <file.mid> [track]  render a melody to audio
 cargo run -- compare                   hum twice, measure agreement
+cargo run -- index <dir> [out.txt]     index a whole corpus, recursively
+cargo run -- find <index.txt> [wav]    hum, search the indexed corpus
+cargo run -- verify-index [index.txt]  retrieval accuracy across the corpus
 cargo run -- export [out.json]         melody shapes for the web version
 cargo run -- selftest                  matching, against known answers
 cargo run -- verify                    every song must identify itself

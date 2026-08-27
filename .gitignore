@@ -15,3 +15,8 @@ web/*.wasm
 
 # generated from midi/ -- see README
 web/songs.json
+
+# downloaded corpus
+/corpus/
+
+/index.txt

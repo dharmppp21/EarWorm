@@ -548,6 +548,174 @@ fn best_in_file(path: &str,shape: &[f32])->Option<(f32,usize,usize,usize)>{
     best
 }
 
+//Walk a tree for .mid files. The corpus is nested Artist/Title.mid, so the
+//flat read_dir the small library uses is not enough.
+fn walk_midis(dir: &std::path::Path,out: &mut Vec<std::path::PathBuf>){
+    let Ok(entries)=std::fs::read_dir(dir) else{ return; };
+
+    for e in entries.flatten(){
+        let p=e.path();
+        if p.is_dir(){ walk_midis(&p,out); }
+        else if p.extension().and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("mid")).unwrap_or(false){
+            out.push(p);
+        }
+    }
+}
+
+//Artist comes from the containing folder, title from the file name, which is
+//how the clean_midi corpus is laid out.
+fn song_name(p: &std::path::Path)->String{
+    let title=p.file_stem().unwrap_or_default().to_string_lossy();
+    let title=title.split('.').next().unwrap_or(&title).trim().to_string();
+
+    match p.parent().and_then(|d| d.file_name()){
+        Some(artist)=>format!("{} - {}",artist.to_string_lossy(),title),
+        None=>title,
+    }
+}
+
+//One pass over the corpus, writing every melody shape to a text index. Parsing
+//17k midis takes minutes; matching against the index takes a second, so this
+//happens once.
+fn build_index(dir: &str,out: &str){
+    let mut paths=Vec::new();
+    walk_midis(std::path::Path::new(dir),&mut paths);
+    paths.sort();
+    println!("{} midi files under {dir}",paths.len());
+
+    let mut index=String::new();
+    let mut kept=0;
+    let mut skipped=0;
+
+    for (i,p) in paths.iter().enumerate(){
+        if i>0 && i%2000==0{ println!("  {i}/{} ({kept} shapes)",paths.len()); }
+
+        //One bad file must not abort a corpus-wide scan.
+        let Ok(tracks)=std::panic::catch_unwind(||load_midi_tracks(&p.to_string_lossy())) else{
+            skipped+=1;
+            continue;
+        };
+
+        let name=song_name(p).replace('|',"-");
+        let mut best: Option<Vec<f32>>=None;
+
+        for t in &tracks{
+            if !is_melodic(t){ continue; }
+            let shape=melody_shape(&intervals(&melody_line(&t.notes)));
+            if shape.len()<MIN_USEFUL_MOVES{ continue; }
+
+            //One shape per song: the longest melodic line. Keeping every track
+            //multiplies the chances of a coincidental match.
+            if best.as_ref().map_or(true,|b| shape.len()>b.len()){ best=Some(shape); }
+        }
+
+        if let Some(shape)=best{
+            let moves: Vec<String>=shape.iter().map(|d| format!("{d:.0}")).collect();
+            index.push_str(&name);
+            index.push('|');
+            index.push_str(&moves.join(" "));
+            index.push(0x0a as char);
+            kept+=1;
+        }
+    }
+
+    match std::fs::write(out,&index){
+        Ok(())=>println!("wrote {out}: {kept} songs, {skipped} unreadable, {} bytes",index.len()),
+        Err(e)=>eprintln!("could not write {out}: {e}"),
+    }
+}
+
+fn load_index(path: &str)->Vec<(String,Vec<f32>)>{
+    std::fs::read_to_string(path).unwrap_or_default()
+    .lines()
+    .filter_map(|l|{
+        let (name,moves)=l.split_once('|')?;
+        let shape: Vec<f32>=moves.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if shape.is_empty(){ None } else { Some((name.to_string(),shape)) }
+    })
+    .collect()
+}
+
+//verify, but against a whole corpus. Takes a spread of songs, cuts a slice of
+//each one's own melody, damages it the way a hum is damaged, and asks the index
+//to find it again. This is the only honest way to know whether scale has broken
+//retrieval, since a corpus is far too big to eyeball.
+fn verify_index(path: &str,samples: usize,query_len: usize){
+    let songs=load_index(path);
+    if songs.is_empty(){
+        eprintln!("no songs in {path}");
+        return;
+    }
+
+    let step=(songs.len()/samples.max(1)).max(1);
+    let mut hits=0;
+    let mut total=0;
+    let mut top10=0;
+    let mut margins: Vec<f32>=Vec::new();
+
+    for (name,full) in songs.iter().step_by(step){
+        if full.len()/3+query_len>full.len(){ continue; }
+
+        let mut q: Vec<f32>=full[full.len()/3..full.len()/3+query_len].to_vec();
+        q[3]+=1.0;
+        q[query_len/2]-=1.0;
+        q.remove(query_len/3);
+
+        let mut scored: Vec<(f32,&str)>=songs.iter()
+        .filter(|(_,s)| s.len()>=q.len())
+        .map(|(n,s)| (subsequence_dtw(&q,s).0,n.as_str()))
+        .collect();
+        scored.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+        total+=1;
+        if scored[0].1==name{ hits+=1; }
+        if scored.iter().take(10).any(|(_,n)| *n==name){ top10+=1; }
+        if scored.len()>1 && scored[0].0>1e-4{ margins.push(scored[1].0/scored[0].0); }
+    }
+
+    let avg=if margins.is_empty(){0.0}else{margins.iter().sum::<f32>()/margins.len() as f32};
+    println!("{query_len:>3}-move query: rank1 {hits}/{total}  top10 {top10}/{total}  mean margin {avg:.2}x");
+}
+
+fn match_against_index(path: &str,query: &[f32]){
+    let Some(shape)=query_shape(query,MIN_USEFUL_MOVES) else{ return; };
+
+    let songs=load_index(path);
+    if songs.is_empty(){
+        eprintln!("no songs in {path} -- build it with `index <corpus dir>`");
+        return;
+    }
+
+    println!("searching {} songs...",songs.len());
+
+    let mut scored: Vec<(f32,&str)>=songs.iter()
+    .filter(|(_,s)| s.len()>=shape.len())
+    .map(|(n,s)| (subsequence_dtw(&shape,s).0,n.as_str()))
+    .collect();
+
+    scored.sort_by(|a,b| a.0.total_cmp(&b.0));
+
+    println!("--- top 10 of {} ---",scored.len());
+    for (cost,name) in scored.iter().take(10){
+        println!("  {cost:>7.4}  {name}");
+    }
+
+    if scored.len()>=2{
+        let margin=scored[1].0/scored[0].0.max(1e-6);
+        println!("best {:.4}, next {:.4} -- {margin:.2}x margin",scored[0].0,scored[1].0);
+
+        //A big corpus gives thousands of unrelated melodies a chance to contain
+        //a similar figure, so the bar has to be higher than for a small one.
+        if margin<2.0{
+            println!("verdict: no confident match ({} songs searched -- a small margin means nothing at this scale)",scored.len());
+        }
+        else{
+            println!("verdict: {}",scored[0].1);
+        }
+    }
+}
+
 fn export_songs(dir: &str,out: &str){
     let Ok(entries)=std::fs::read_dir(dir) else{
         eprintln!("could not read {dir}");
@@ -867,6 +1035,27 @@ fn main(){
         }
         Some("verify")=>verify("midi"),
         Some("export")=>export_songs("midi",args.get(1).map(|s| s.as_str()).unwrap_or("web/songs.json")),
+        Some("index")=>{
+            match args.get(1){
+                Some(dir)=>build_index(dir,args.get(2).map(|s| s.as_str()).unwrap_or("index.txt")),
+                None=>eprintln!("usage: cargo run --release -- index <corpus dir> [out.txt]"),
+            }
+        }
+        Some("verify-index")=>{
+            let idx=args.get(1).map(|s| s.as_str()).unwrap_or("index.txt");
+            for len in [12usize,16,20,26,34]{
+                verify_index(idx,60,len);
+            }
+        }
+        Some("find")=>{
+            match args.get(1){
+                Some(idx)=>{
+                    let query=capture_intervals(args.get(2).map(|s| s.as_str()));
+                    match_against_index(idx,&query);
+                }
+                None=>eprintln!("usage: cargo run --release -- find <index.txt> [take.wav]"),
+            }
+        }
         Some("synth")=>{
             match args.get(1){
                 Some(path)=>{
